@@ -105,7 +105,7 @@ jobs:
           which gcc 2>&1 || echo "which gcc failed"
           gcc --version 2>&1 | head -1 || echo "gcc invocation failed"
           mkdir -p dist/${{ matrix.os }}-${{ matrix.arch }}
-          PLUGINS="workbuddy qoder trae zcode mimo"
+          PLUGINS="zcode"
           for plugin in $PLUGINS; do
             echo "=== Building $plugin ==="
             cd plugins/$plugin
@@ -134,7 +134,7 @@ jobs:
           CC: ${{ matrix.cc }}
         run: |
           mkdir -p dist/${{ matrix.os }}-${{ matrix.arch }}
-          PLUGINS="workbuddy qoder trae zcode mimo"
+          PLUGINS="zcode"
           for plugin in $PLUGINS; do
             echo "=== Building $plugin ==="
             cd plugins/$plugin
@@ -154,82 +154,14 @@ jobs:
           done
         shell: bash
 
-      # Split-channel flavor (issue #29): the legacy per-variant plugins,
-      # built from the SAME source purely via ldflags injection —
-      #   -X main.providerName=<id>      → registered plugin id / auth-file
-      #                                    namespace / panel entry
-      #   -X main.pluginVariantPin=<pin> → default login_region/login_variant
-      # One zip per platform: cpa-multi-plugins-split-<os>-<arch>.zip.
-      - name: Build split-channel plugins (Windows)
-        if: matrix.os == 'windows'
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 1
-          CC: gcc
-        run: |
-          mkdir -p dist-split/${{ matrix.os }}-${{ matrix.arch }}
-          SPLIT="codebuddy-cn:workbuddy:cn codebuddy-intl:workbuddy:intl qoder-cn:qoder:cn qoder-intl:qoder:intl trae-cn:trae:cn trae-solo-cn:trae:solo trae-intl:trae:intl"
-          for entry in $SPLIT; do
-            name="${entry%%:*}"; rest="${entry#*:}"; dir="${rest%%:*}"; pin="${rest##*:}"
-            echo "=== Building $name (from $dir, pin=$pin) ==="
-            cd plugins/$dir
-            go mod download
-            VER="$(tr -d '[:space:]' < VERSION 2>/dev/null || true)"
-            VFLAG=""
-            [ -n "$VER" ] && VFLAG="-X main.version=$VER"
-            OUTPUT="../../dist-split/${{ matrix.os }}-${{ matrix.arch }}/${name}.${{ matrix.ext }}"
-            go build -buildmode=c-shared -trimpath -ldflags="-s -w -X main.providerName=$name -X main.pluginVariantPin=$pin $VFLAG" -o "$OUTPUT" .
-            if [ $? -eq 0 ]; then
-              echo "  ✅ $name built"
-            else
-              echo "  ❌ $name failed"
-              exit 1
-            fi
-            cd ../..
-          done
-        shell: msys2 {0}
-
-      - name: Build split-channel plugins (non-Windows)
-        if: matrix.os != 'windows'
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 1
-          CC: ${{ matrix.cc }}
-        run: |
-          mkdir -p dist-split/${{ matrix.os }}-${{ matrix.arch }}
-          SPLIT="codebuddy-cn:workbuddy:cn codebuddy-intl:workbuddy:intl qoder-cn:qoder:cn qoder-intl:qoder:intl trae-cn:trae:cn trae-solo-cn:trae:solo trae-intl:trae:intl"
-          for entry in $SPLIT; do
-            name="${entry%%:*}"; rest="${entry#*:}"; dir="${rest%%:*}"; pin="${rest##*:}"
-            echo "=== Building $name (from $dir, pin=$pin) ==="
-            cd plugins/$dir
-            go mod download
-            VER="$(tr -d '[:space:]' < VERSION 2>/dev/null || true)"
-            VFLAG=""
-            [ -n "$VER" ] && VFLAG="-X main.version=$VER"
-            OUTPUT="../../dist-split/${{ matrix.os }}-${{ matrix.arch }}/${name}.${{ matrix.ext }}"
-            go build -buildmode=c-shared -trimpath -ldflags="-s -w -X main.providerName=$name -X main.pluginVariantPin=$pin $VFLAG" -o "$OUTPUT" .
-            if [ $? -eq 0 ]; then
-              echo "  ✅ $name built"
-            else
-              echo "  ❌ $name failed"
-              exit 1
-            fi
-            cd ../..
-          done
-        shell: bash
-
       - name: Package artifacts (Windows)
         if: matrix.os == 'windows'
         shell: powershell
         run: |
           Get-ChildItem dist/${{ matrix.os }}-${{ matrix.arch }} -Filter *.dll | ForEach-Object { Write-Host "  $($_.Name)" }
           Compress-Archive -Path "dist/${{ matrix.os }}-${{ matrix.arch }}/*.dll" -DestinationPath "cpa-multi-plugins-${{ matrix.os }}-${{ matrix.arch }}.zip" -Force
-          Get-ChildItem dist-split/${{ matrix.os }}-${{ matrix.arch }} -Filter *.dll | ForEach-Object { Write-Host "  split: $($_.Name)" }
-          Compress-Archive -Path "dist-split/${{ matrix.os }}-${{ matrix.arch }}/*.dll" -DestinationPath "cpa-multi-plugins-split-${{ matrix.os }}-${{ matrix.arch }}.zip" -Force
-          Write-Host "Created zips:"
-          Get-Item "cpa-multi-plugins*${{ matrix.os }}-${{ matrix.arch }}.zip" | Select-Object Name, Length
+          Write-Host "Created zip:"
+          Get-Item "cpa-multi-plugins-${{ matrix.os }}-${{ matrix.arch }}.zip" | Select-Object Name, Length
 
       - name: Package artifacts (non-Windows)
         if: matrix.os != 'windows'
@@ -237,9 +169,6 @@ jobs:
           cd dist/${{ matrix.os }}-${{ matrix.arch }}
           rm -f *.h
           zip -r ../../cpa-multi-plugins-${{ matrix.os }}-${{ matrix.arch }}.zip .
-          cd ../../dist-split/${{ matrix.os }}-${{ matrix.arch }}
-          rm -f *.h
-          zip -r ../../cpa-multi-plugins-split-${{ matrix.os }}-${{ matrix.arch }}.zip .
           cd ../..
           ls -lh cpa-multi-plugins*.zip
         shell: bash
@@ -248,14 +177,57 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cpa-multi-plugins-${{ matrix.os }}-${{ matrix.arch }}
-          path: |
-            cpa-multi-plugins-${{ matrix.os }}-${{ matrix.arch }}.zip
-            cpa-multi-plugins-split-${{ matrix.os }}-${{ matrix.arch }}.zip
+          path: cpa-multi-plugins-${{ matrix.os }}-${{ matrix.arch }}.zip
           retention-days: 30
+
+  # Fork addition: upstream only BUILDS, so a broken test suite would still ship
+  # an artifact. This fork's zcode plugin carries a real suite, and the release
+  # job waits on it.
+  test:
+    name: Test zcode
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: false
+
+      # .gitattributes pins eol=lf, so a CRLF checkout cannot silently make every
+      # file "unformatted" here -- if this fails it is a real formatting miss.
+      - name: gofmt
+        working-directory: plugins/zcode
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt reports unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # CGO_ENABLED=1 is load-bearing: main.go is the only file importing "C",
+      # and with CGO disabled it is silently excluded from the build.
+      - name: go vet
+        working-directory: plugins/zcode
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go mod download
+          go vet ./...
+
+      - name: go test
+        working-directory: plugins/zcode
+        env:
+          CGO_ENABLED: 1
+        run: go test -count=1 ./...
 
   release:
     name: Create Release
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     # Deep-audit hardening: publish only when the build job itself succeeded.
     # The optional darwin-amd64 cross leg keeps reporting success via
@@ -299,48 +271,32 @@ jobs:
           body: |
             # cpa-multi-plugins ${{ steps.version.outputs.version }}
 
-            5 unified CPA plugins: **CodeBuddy/WorkBuddy**, **Qoder**, **Trae**, **ZCode (GLM coding plan)**, **MiMo** — the first three merge the former CN/Intl/solo variants with automatic legacy auth-file adoption.
+            **Fork** of [mmqz/cpa-multi-plugins](https://github.com/mmqz/cpa-multi-plugins), trimmed to one plugin:
+            **zcode** (GLM coding plan). The other four plugins are still in the tree but are not built here —
+            see `.github/workflows/release.yml`.
+
+            Build gate: `gofmt` + `go vet` + `go test` must pass before anything publishes.
 
             ## Downloads
-
-            ### Unified package (default, recommended)
             - `cpa-multi-plugins-linux-amd64.zip` — Linux x86_64
             - `cpa-multi-plugins-linux-arm64.zip` — Linux ARM64
             - `cpa-multi-plugins-darwin-arm64.zip` — macOS Apple Silicon
             - `cpa-multi-plugins-darwin-amd64.zip` — macOS Intel (cross-built on an arm64 runner)
             - `cpa-multi-plugins-windows-amd64.zip` — Windows x86_64
 
-            ### Split-channel package (issue #29)
-            Same platform list with a `cpa-multi-plugins-split-<os>-<arch>.zip` each. Contains the legacy **per-variant plugins** — `codebuddy-cn`, `codebuddy-intl`, `qoder-cn`, `qoder-intl`, `trae-cn`, `trae-solo-cn`, `trae-intl` — each with its own panel entry and its own OAuth login pinned to its realm. Install INSTEAD of (not next to) the unified plugin of the same provider; enable them in config.yaml by their own ids (`plugins.configs.codebuddy-intl.enabled: true`, …).
-
-            ## Installation (verified against real CLIProxyAPI host)
+            ## Installation
             1. Download and unzip the archive for your platform.
-            2. Copy the `.so`/`.dylib`/`.dll` files to your CPA plugins directory (e.g. `plugins/linux/amd64/`).
-            3. **Each plugin must be explicitly enabled** in `config.yaml` (per-plugin default is disabled):
+            2. Copy `zcode.so` / `zcode.dylib` / `zcode.dll` into your CPA plugins directory.
+            3. **Enable it explicitly** in `config.yaml` (the per-plugin default is disabled):
                ```yaml
                plugins:
                  enabled: true
                  dir: "plugins"
                  configs:
-                   workbuddy: { enabled: true }
-                   qoder: { enabled: true }
-                   trae: { enabled: true }
                    zcode: { enabled: true }
-                   mimo: { enabled: true }
                ```
-            4. Restart CPA and check logs for `pluginhost: plugin registered plugin_id=workbuddy/qoder/trae/zcode/mimo`.
-            5. Login accounts via the management panel or Management API. Legacy `codebuddy-cn-/codebuddy-intl-/qoder-cn-/qoder-intl-/trae-cn-/trae-solo-cn-/trae-intl-` auth files are adopted automatically; zcode adopts a legacy single-file `zcode.json`; mimo adopts the desktop's SSO session automatically (Chromium partition cookie jar → service-ticket re-mint).
-
-            ## Plugins
-            | Plugin | Covers | Realms | Login options |
-            |---|---|---|---|
-            | workbuddy | CodeBuddy + WorkBuddy + codebuddy-cn + codebuddy-intl | CN (copilot.tencent.com) / Global (workbuddy.ai) / Intl (codebuddy.ai) | CLI + IDE, per-account region |
-            | qoder | Qoder + qoder-cn + qoder-intl | CN (qoder.com.cn) / Intl (qoder.com) | Device flow + PAT, per-account region |
-            | trae | Trae CN + Trae SOLO CN + Trae Intl | CN (api.trae.cn) / SOLO / Intl (marscode) | Per-variant device flow |
-            | zcode | GLM coding plan (ZCode desktop parity) | Intl (api.z.ai) / CN (open.bigmodel.cn) | OAuth CLI poll flow + legacy zcode.json adoption, per-account provider |
-            | mimo | Xiaomi MiMo (mimocode CLI + desktop parity) | CN / SGP / RU / IN (mimo-server-<region>.xiaomimimo.com) | sk OAuth (permanent) + desktop SSO cookie adoption, per-account region |
-
-            See [README](https://github.com/mmqz/cpa-multi-plugins#readme) for details.
+            4. Restart CPA and check the log for `pluginhost: plugin registered plugin_id=zcode`.
+            5. Log in via the management panel or the Management API. A legacy single-file `zcode.json` is adopted automatically.
           files: release/*.zip
           draft: false
           prerelease: false

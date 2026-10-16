@@ -1,5 +1,10 @@
 # cpa-multi-plugins
 
+> **This is a fork.** [`Knight-ask-art/cpa-multi-plugins`](https://github.com/Knight-ask-art/cpa-multi-plugins) is a
+> personal fork of [`mmqz/cpa-multi-plugins`](https://github.com/mmqz/cpa-multi-plugins). Its build matrix covers the
+> **zcode** plugin only, and a test gate (`gofmt` + `go vet` + `go test`) runs in front of the release job. The other
+> four plugins are still in the tree, untouched and unbuilt. Everything below still describes the upstream project.
+
 Provider plugins for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). Each plugin merges the regional variants of one provider family behind a single identifier and compiles to a C-shared library (`.so` / `.dll` / `.dylib`) for linux amd64/arm64, darwin amd64/arm64 and windows amd64.
 
 | Plugin | Version |
