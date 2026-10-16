@@ -1,0 +1,18 @@
+# The upstream repo shipped no line-ending policy, so a Windows checkout with
+# core.autocrlf=true rewrote every .go file to CRLF. That makes `gofmt -l` flag
+# the whole tree and turns any one-line edit into a whole-file diff. Pin the
+# policy here instead of relying on each clone's git config.
+* text=auto eol=lf
+
+*.go    text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.html  text eol=lf
+
+# Build artifacts must never be line-ending translated.
+*.dll binary
+*.so  binary
+*.exe binary
+*.zip binary
