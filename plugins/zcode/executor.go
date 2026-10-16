@@ -42,6 +42,11 @@ type chatRoute struct {
 	anthropic       bool
 	applyHeaders    func(*http.Request, *storedAuth, string)
 	offPeakTicketID string
+	// plane is the display identity of the upstream this route rides
+	// (plane_track.go). Every construction site sets it; the dispatch sites
+	// count a hit under it so the panel can show which channel actually
+	// served the traffic.
+	plane string
 }
 
 // routeFor resolves the chat route for one credential and model: start-plan
@@ -51,9 +56,12 @@ type chatRoute struct {
 // OpenAI-compatible endpoint with the resolved plan key.
 func routeFor(sa *storedAuth, model string) chatRoute {
 	if sa.Auth.Plan == planStart || modelRidesStartPlane(sa, model) {
-		return chatRoute{endpoint: startPlanAnthropicEndpoint, anthropic: true, applyHeaders: applyStartPlanChatHeaders}
+		return chatRoute{endpoint: startPlanAnthropicEndpoint, anthropic: true, applyHeaders: applyStartPlanChatHeaders, plane: planeJWTAnthropic}
 	}
-	return chatRoute{endpoint: chatEndpointFor(sa), applyHeaders: applyChatHeaders}
+	if authProviderFor(sa) == providerBigmodel {
+		return chatRoute{endpoint: chatEndpointFor(sa), applyHeaders: applyChatHeaders, plane: planeBigmodelCoding}
+	}
+	return chatRoute{endpoint: chatEndpointFor(sa), applyHeaders: applyChatHeaders, plane: planeZaiCoding}
 }
 
 // offPeakRouteFor builds the ticketed anthropic chat route (offpeak.go owns
@@ -64,6 +72,7 @@ func offPeakRouteFor(sa *storedAuth, ticketID string) chatRoute {
 		anthropic:       true,
 		applyHeaders:    func(req *http.Request, s *storedAuth, body string) { applyOffPeakChatHeaders(req, s, ticketID) },
 		offPeakTicketID: ticketID,
+		plane:           planeOffPeak,
 	}
 }
 
@@ -92,6 +101,9 @@ func buildChatBody(payload []byte, upstreamModel string, stream bool) (string, e
 	obj["model"] = modelJSON
 	streamJSON, _ := json.Marshal(stream)
 	obj["stream"] = streamJSON
+	// Only ever lowers a ceiling the client already set; a body with none is
+	// left for the upstream's own default (model_policy.go).
+	clampBodyMaxTokens(obj)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return "", err
@@ -103,11 +115,12 @@ func buildChatBody(payload []byte, upstreamModel string, stream bool) (string, e
 // chat call: identity (g6n) + trace + auth + SDK UA suffix + V4 signing
 // headers (via the signing manager's retry ladder in the send paths).
 func applyChatHeaders(req *http.Request, sa *storedAuth, body string) {
+	id := zcodeIdentity()
 	req.Header.Set("Content-Type", "application/json")
-	for k, v := range buildLlmIdentityHeaders(zcodeIdentity()) {
+	for k, v := range buildLlmIdentityHeaders(id) {
 		req.Header.Set(k, v)
 	}
-	applyTraceHeaders(req)
+	applyTraceHeadersWith(req, id)
 	req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
 	ua := req.Header.Get("User-Agent")
 	if ua != "" {
@@ -118,11 +131,29 @@ func applyChatHeaders(req *http.Request, sa *storedAuth, body string) {
 // applyTraceHeaders mirrors the client's attribution header set for
 // coding-plan traffic: five UUID-attributed headers with session-type main.
 func applyTraceHeaders(req *http.Request) {
+	applyTraceHeadersWith(req, zcodeIdentity())
+}
+
+// applyTraceHeadersWith stamps the trace set from an already-resolved identity
+// snapshot.
+//
+// Every id is a fresh UUID in real traffic, so neither identity_session_id nor
+// identity_trace_id has a default: a constant id across thousands of requests
+// is a distinguisher no real client produces, and pinning one is only useful
+// for reproducing a specific capture. The pins are applied where they exist and
+// ignored where they don't, per-id, so pinning the trace id does not
+// accidentally freeze the session id — and vice versa.
+//
+// x-session-id is the one with a consumer beyond attribution: the V4 signing
+// message binds to it (sessionIdFromRequest reads it back off the request), so
+// a pin changes the signature too. That stays self-consistent because the
+// signer reads the header rather than generating its own.
+func applyTraceHeadersWith(req *http.Request, id identityConfigSnapshot) {
 	req.Header.Set("x-request-id", uuid.NewString())
 	req.Header.Set("x-zcode-session-type", "main")
-	req.Header.Set("x-zcode-trace-id", uuid.NewString())
+	req.Header.Set("x-zcode-trace-id", firstNonEmpty(id.traceID, uuid.NewString()))
 	req.Header.Set("x-query-id", uuid.NewString())
-	req.Header.Set("x-session-id", uuid.NewString())
+	req.Header.Set("x-session-id", firstNonEmpty(id.sessionID, uuid.NewString()))
 }
 
 // sessionIdFromRequest extracts the x-session-id value — the signing message
@@ -139,13 +170,14 @@ func sessionIdFromRequest(req *http.Request) string {
 // real anthropic-kind LLM requests arrive as
 // `ZCode/{ver} ai-sdk/anthropic/3.0.81`).
 func applyStartPlanChatHeaders(req *http.Request, sa *storedAuth, body string) {
+	id := zcodeIdentity()
 	req.Header.Set("Content-Type", "application/json")
-	for k, v := range buildLlmIdentityHeaders(zcodeIdentity()) {
+	for k, v := range buildLlmIdentityHeaders(id) {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("x-request-id", uuid.NewString())
 	req.Header.Set("x-zcode-session-type", "main")
-	req.Header.Set("x-zcode-trace-id", uuid.NewString())
+	req.Header.Set("x-zcode-trace-id", firstNonEmpty(id.traceID, uuid.NewString()))
 	req.Header.Set("Authorization", "Bearer "+sa.Auth.JWT)
 	req.Header.Set("anthropic-version", anthropicVersion)
 	ua := req.Header.Get("User-Agent")

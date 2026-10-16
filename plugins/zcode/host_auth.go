@@ -24,10 +24,10 @@ type rpcHostAuthGetResponse struct {
 	JSON      json.RawMessage `json:"json"`
 }
 
-// hostAuthList returns all zcode credentials known to the host. The
+// hostAuthListImpl returns all zcode credentials known to the host. The
 // "zcode-" prefix matches canonical zcode-<provider>-<uid>.json plus the
 // legacy single file zcode.json.
-func hostAuthList() ([]pluginapi.HostAuthFileEntry, error) {
+func hostAuthListImpl() ([]pluginapi.HostAuthFileEntry, error) {
 	raw, err := hostCall(pluginabi.MethodHostAuthList, nil)
 	if err != nil {
 		return nil, err
@@ -55,8 +55,8 @@ func hostAuthList() ([]pluginapi.HostAuthFileEntry, error) {
 	return out, nil
 }
 
-// hostAuthGet fetches the credential JSON for one auth index.
-func hostAuthGet(authIndex string) (*storedAuth, error) {
+// hostAuthGetImpl fetches the credential JSON for one auth index.
+func hostAuthGetImpl(authIndex string) (*storedAuth, error) {
 	phys, err := hostAuthGetPhysical(authIndex)
 	if err != nil {
 		return nil, err
@@ -64,9 +64,9 @@ func hostAuthGet(authIndex string) (*storedAuth, error) {
 	return parseStored(phys.JSON)
 }
 
-// hostAuthGetBundle is one host.auth.get for both storage and physical
+// hostAuthGetBundleImpl is one host.auth.get for both storage and physical
 // metadata (avoids a double-RPC in dashboard paths).
-func hostAuthGetBundle(authIndex string) (*storedAuth, *hostAuthPhysical, error) {
+func hostAuthGetBundleImpl(authIndex string) (*storedAuth, *hostAuthPhysical, error) {
 	phys, err := hostAuthGetPhysical(authIndex)
 	if err != nil {
 		return nil, nil, err
@@ -77,6 +77,22 @@ func hostAuthGetBundle(authIndex string) (*storedAuth, *hostAuthPhysical, error)
 	}
 	return sa, phys, nil
 }
+
+// hostAuth*Fn are the injectable seams for the three auth-store reads.
+//
+// authfile.go already exposes hostAuthGetPhysicalFn / hostAuthPersistFn for the
+// same reason, but the list/get pair had no seam at all: every management and
+// dashboard path starts with hostAuthList(), which calls hostCall, which needs
+// a live cgo host pointer that a unit test cannot fabricate. That is why
+// panel.go had zero in-process coverage. Routing these three through vars costs
+// one indirection per call and makes the whole management surface testable.
+//
+// Tests must restore the originals (see newFakeHostAuthStore in panel_test.go).
+var (
+	hostAuthList      = hostAuthListImpl
+	hostAuthGet       = hostAuthGetImpl
+	hostAuthGetBundle = hostAuthGetBundleImpl
+)
 
 // hostAuthListFiles is the unfiltered list (models/adopt paths filter
 // themselves).

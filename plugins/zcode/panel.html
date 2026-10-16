@@ -35,9 +35,27 @@ button.sec{background:var(--btn-sec);color:var(--fg)}button:disabled{opacity:.5;
 .badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:99px;background:var(--ok-soft);color:var(--ok);border:1px solid var(--ok-border)}
 .badge.exhausted{background:var(--err-soft);color:var(--err);border-color:var(--err-border)}
 .badge.plan{background:var(--warn-soft);color:var(--warn);border-color:var(--warn-border)}
+.badge.risk{background:var(--warn-soft);color:var(--warn);border-color:var(--warn-border)}
+.badge.risk.hard{background:var(--err-soft);color:var(--err);border-color:var(--err-border)}
 .stat{display:flex;justify-content:space-between;font-size:13px;padding:3px 0}
 .stat .k{color:var(--mut)}.stat .v{font-weight:600}
 .cool{margin-top:10px;font-size:12px;color:var(--err)}
+.pl-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:4px}
+.pl-row{border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+.pl-row.pl-idle{opacity:.55}
+.pl-hd{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.pl-hd b{font-size:13px}
+.pl-n{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
+.pl-note{color:var(--mut);font-size:11px;margin-top:3px;line-height:1.45}
+.pl-meta{color:var(--mut);font-size:11px;font-family:ui-monospace,monospace;display:block;margin-top:6px}
+.id-row{display:flex;gap:10px;font-size:12px;padding:3px 0;border-bottom:1px solid var(--border)}
+.id-row:last-child{border-bottom:0}
+.id-k{flex:0 0 180px;color:var(--mut)}
+.id-v{flex:1;word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace}
+.id-warn{margin-top:10px;padding:8px 10px;border:1px solid var(--warn-border);background:var(--warn-soft);color:var(--warn);border-radius:8px;font-size:12px;line-height:1.5}
+.id-warn code{background:rgba(0,0,0,.18);padding:1px 4px;border-radius:4px}
+.pl-fb{margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:12px;color:var(--mut)}
+.pl-fb b{color:var(--fg)}
 .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:8px 16px;border-radius:8px;opacity:0;transition:opacity .2s;pointer-events:none}
 .toast.show{opacity:.92}
 .summary{padding:14px 16px;margin-bottom:16px;display:flex;gap:18px;flex-wrap:wrap;font-size:13px}
@@ -93,6 +111,42 @@ button.sec{background:var(--btn-sec);color:var(--fg)}button:disabled{opacity:.5;
     <div class="bar" style="margin-top:10px"><button onclick="mintPoolTokens(this)">验证码补给 ×3</button></div>
   </div>
   <div id="claimBox" style="display:none"></div>
+  <div class="card" id="identityCard" style="margin:0 0 14px">
+    <h2>伪装头 <span class="badge">identity</span></h2>
+    <div class="sub">插件向上游发送的身份头实际值。推导默认值是照参考实现推出来的，对不对得上真实抓包就看这里。</div>
+    <div id="identityBox"><div class="sub">加载中…</div></div>
+  </div>
+
+  <div class="card" id="modelCard" style="margin:0 0 14px">
+    <h2>模型命名与映射 <span class="badge">model</span></h2>
+    <div class="sub">客户端看到的模型名，和上游真正收到的模型名，可能不是同一个。这里显示实际的映射结果——包括配了但不会生效的条目。</div>
+    <div id="modelBox"><div class="sub">加载中…</div></div>
+  </div>
+
+  <div class="card" id="credCard" style="margin:0 0 14px">
+    <h2>凭据状态 <span class="badge">dual-cred</span></h2>
+    <div class="sub">一个账号有两套凭据：plan JWT（走 zcode.z.ai 的 anthropic 网关）和 coding-plan API key（走 api.z.ai / bigmodel）。两边是各自独立的上游，坏了一个不影响另一个。这里显示哪一边被暂时停用、为什么、还有多久恢复。状态存在插件进程内存里，重启清零。</div>
+    <div id="credFallback" class="sub" style="margin:10px 0"></div>
+    <div id="credBox"></div>
+  </div>
+
+  <div class="card" id="clientCard" style="margin:0 0 14px">
+    <h2>从本机客户端导入 <span class="badge">import</span></h2>
+    <div class="sub">本机装了 ZCode 客户端并且已经登录的话，可以直接把它的凭据导进来，不用再走一遍浏览器 OAuth。插件不会自己去读那个文件——点下面的按钮才会读，而且第一次只是扫描，什么都不写。</div>
+    <div style="margin:10px 0"><button onclick="scanClientCredential()">扫描本机客户端</button>
+      <span class="sub" id="clientHint" style="margin-left:8px"></span></div>
+    <div id="clientBox"><div class="sub">还没扫描。</div></div>
+  </div>
+
+  <div class="card" id="planeCard" style="margin:0 0 14px">
+    <h2>上游通道
+      <span style="display:flex;gap:6px;align-items:center">
+        <span class="sub" style="margin:0" id="planeTotal"></span>
+      </span>
+    </h2>
+    <div class="sub" style="margin:4px 0 12px">zcode 会把请求送到三条上游通道之一，走哪条是隐式决定的：coding 两区由账号的 provider 选，JWT anthropic 由 plan 与活动套餐的模型资格选，闲时通道由配置开启。这里显示实际命中的次数。</div>
+    <div id="planeBox"><div class="sub">加载中…</div></div>
+  </div>
   <div class="grid" id="cards"></div>
 </div>
 <div class="toast" id="toast"></div>
@@ -180,6 +234,10 @@ async function load(force, quota){
     '账号 <b>'+fmt(s.account_count)+'</b> · 总余量 <b>'+fmt(s.total_remain)+'</b> · 已用 <b>'+fmt(s.total_used)+'</b>'
     + ' · Z.AI <b>'+fmt(s.zai_remain)+'</b> / BigModel <b>'+fmt(s.bigmodel_remain)+'</b>'
     + (s.exhausted_count ? ' · <span style="color:var(--err)">耗尽 '+s.exhausted_count+'</span>' : '');
+  renderPlanes(data.planes);
+  renderIdentity(data.identity);
+  renderModelPolicy(data.model_policy);
+  renderCredState(data.cred_state);
   el.innerHTML = '';
   (data.accounts||[]).forEach(a=>{
     const card = document.createElement('div');
@@ -191,23 +249,257 @@ async function load(force, quota){
         + (a.credits.total_size ? '<div class="stat"><span class="k">池</span><span class="v">'+fmt(a.credits.total_size)+'</span></div>' : '')
       : '<div class="stat"><span class="k">配额</span><span class="v" style="color:var(--mut)">点击刷新加载</span></div>';
     const cool = (a.cooling||[]).map(c=>c.model+'('+c.reason+' '+c.seconds+'s)').join('、');
+    // Provider switch. The button is only live when the credential actually
+    // holds the other provider's OAuth token, which the server reports as
+    // can_switch (panel.go -> swappableProviders). A disabled button with the
+    // reason in its tooltip beats a click that comes back "需重新登录".
+    const other = (a.provider==='bigmodel')?'zai':'bigmodel';
+    const otherLabel = (other==='bigmodel')?'BigModel':'Z.AI';
+    const canSwap = (a.can_switch||[]).indexOf(other) >= 0;
+    // Risk control (biz 3012): the upstream content/identity gate challenged
+    // this account. It is account-wide, so unlike a model cooldown it is worth
+    // putting on the card header rather than the cooling line.
+    const risk = a.risk;
+    const riskBadge = risk
+      ? (risk.quarantined
+          ? '<span class="badge risk hard">风控隔离</span> '
+          : '<span class="badge risk">风控暂停</span> ')
+      : '';
+    const swapBtn = canSwap
+      ? '<button class="sec" onclick="switchProvider(\''+a.auth_index+'\',\''+other+'\')" title="用该账号存下的 '+otherLabel+' OAuth token 重新解析 key 后切换；失败则凭据不改动">切到 '+otherLabel+'</button>'
+      : '<button class="sec" disabled title="该账号没有存下 '+otherLabel+' 的 OAuth token。token 只能由登录时的那次 poll 拿到，需用 login_provider='+other+' 重新登录一次补齐">切到 '+otherLabel+'（需重新登录）</button>';
     card.innerHTML =
       '<h2>'+(a.nickname||a.uid||'账号')+' <span>'
       + '<span class="badge">'+(a.provider||'zai').toUpperCase()+'</span> '
       + (a.plan==='start-plan'?'<span class="badge plan">START</span> ':'')
       + (a.exhausted?'<span class="badge exhausted">耗尽</span>':'<span class="badge">正常</span>')
+      + (riskBadge?' '+riskBadge:'')
       + '</span></h2>'
       + '<div class="uid">'+(a.name||'')+'</div>'
       + quotaHtml
       + (cool?'<div class="cool">冷却中：'+cool+'</div>':'')
+      + (risk?'<div class="cool">风控：24 小时内 '+fmt(risk.strikes)+' 次'
+          + (risk.last_code?'（最近 '+escHtml(risk.last_code)+(risk.last_model?' @ '+escHtml(risk.last_model):'')+'）':'')
+          + (risk.quarantined?' · 已隔离，路由已停用该账号，需手动解除'
+             :(risk.until?' · 暂停至 '+escHtml(risk.until)+'（'+fmt(risk.seconds)+'s）':''))
+          + ' · 换个模型重试同样会失败</div>':'')
       + (a.error?'<div class="err">'+a.error+'</div>':'')
       + '<div class="bar" style="margin-top:12px">'
       + '<button '+(a.selected?'disabled':'')+' onclick="select(\''+a.auth_index+'\')">设为路由账号</button>'
       + '<button class="sec" onclick="loadOne(\''+a.auth_index+'\')">刷新配额</button>'
       + '<button class="sec" onclick="switchPlan(\''+a.auth_index+'\','+'\''+(a.plan==='start-plan'?'coding-plan':'start-plan')+'\''+')">切到 '+(a.plan==='start-plan'?'coding':'start')+'</button>'
+      + swapBtn
+      + (risk?'<button class="sec" onclick="clearRisk(\''+a.auth_index+'\')" title="清除该账号的风控打击计数并解除暂停/隔离">解除风控</button>':'')
       + '</div>';
     el.appendChild(card);
   });
+}
+// Effective fingerprint values. Read-only: they come from plugin config
+// (identity_*), which the host config page edits, not this panel.
+function renderIdentity(v){
+  const box=document.getElementById('identityBox');
+  if(!box) return;
+  if(!v){ box.innerHTML='<div class="sub">暂无身份数据</div>'; return; }
+  const row=(k,val)=>'<div class="id-row"><span class="id-k">'+escHtml(k)+'</span><span class="id-v">'+(val?escHtml(val):'<i>（不发此头）</i>')+'</span></div>';
+  let html=''
+    +row('X-Platform',v.platform)
+    +row('X-Os-Category',v.os_category)
+    +row('X-Os-Version',v.os_version)
+    +row('X-ZCode-App-Version',v.app_version)
+    +row('X-Title','Z Code@'+(v.source_title||''))
+    +row('X-Release-Channel',v.release_channel)
+    +row('HTTP-Referer',v.referer)
+    +row('X-Client-Language',v.language)
+    +row('X-Client-Timezone',v.timezone);
+  const pins=[];
+  if(v.device_mid_pinned) pins.push('identity_device_mid');
+  if(v.session_id_pinned) pins.push('identity_session_id');
+  if(v.trace_id_pinned) pins.push('identity_trace_id');
+  if(v.os_version_missing){
+    // The honest gap: X-Os-Category says windows/macos but no version rides
+    // beside it, while a real client on those platforms always sends one.
+    html+='<div class="id-warn">X-Os-Version 为空：本机读不到 OS 版本（/proc 只在 Linux 上有）。'
+      +'真实客户端在 Windows/macOS 上一定会发这个头，所以这是一个可被识别的差异。'
+      +'用 <code>identity_os_version</code> 填上真实版本号即可。</div>';
+  }
+  if(pins.length){
+    html+='<div class="id-warn">已固定：'+escHtml(pins.join('、'))+'。真实客户端每次请求都换新 UUID，固定值只适合复现特定抓包。</div>';
+  }
+  html+='<div class="sub" style="margin:8px 0 0">值来自插件配置的 identity_* 键（宿主配置页可改）。</div>';
+  box.innerHTML=html;
+}
+function renderModelPolicy(v){
+  const box=document.getElementById('modelBox');
+  if(!box) return;
+  if(!v){ box.innerHTML='<div class="sub">暂无模型策略数据</div>'; return; }
+  const row=(k,val,note)=>{
+    const shown = val ? escHtml(val) : '<i>'+(note||'（未设置）')+'</i>';
+    return '<div class="id-row"><span class="id-k">'+escHtml(k)+'</span><span class="id-v">'+shown+'</span></div>';
+  };
+  let html=''
+    +row('model_prefix', v.prefix, '未设置，目录用裸 id')
+    +row('model_max_tokens', v.max_tokens?v.max_tokens:'', '不设上限，交给上游默认');
+  const rows=v.aliases||[];
+  if(!rows.length){
+    html+='<div class="sub" style="margin:10px 0 0">没有配置别名（model_map）。配了之后，客户端用别的名字也能路由到同一个模型。</div>';
+  } else {
+    html+='<div class="sub" style="margin:10px 0 4px">别名 → 上游模型（共 '+fmt(v.count)+' 条）：</div>';
+    html+=rows.map(r=>{
+      const bad=(v.unresolved||[]).indexOf(r.alias+' → '+r.target)>=0;
+      return '<div class="id-row"><span class="id-k">'+escHtml(r.alias)+'</span>'
+        +'<span class="id-v" style="'+(bad?'color:var(--err)':'')+'">'+escHtml(r.target)
+        +' <span style="color:var(--mut)">('+escHtml(r.target_name)+')</span></span></div>';
+    }).join('');
+  }
+  if((v.unresolved||[]).length){
+    // A target that is not in the pinned catalog is a config typo that is
+    // otherwise completely silent: the alias simply never appears anywhere.
+    html+='<div class="id-warn">这些别名指向的模型不在内置目录里，因此永远不会生效：<code>'
+      +escHtml((v.unresolved||[]).join('</code>、<code>'))+'</code>。'
+      +'检查拼写，或改成目录里真实存在的模型 id。</div>';
+  }
+  if(v.prefix){
+    html+='<div class="sub" style="margin:8px 0 0">目录对外是 <code>'+escHtml(v.prefix)+'/&lt;模型&gt;</code>；客户端发裸 id 也仍然能路由到同一个模型。</div>';
+  }
+  html+='<div class="sub" style="margin:8px 0 0">别名只在其目标通过套餐/闲时/冷却/排除过滤时才出现在目录里。值来自插件配置的 model_prefix / model_map / model_max_tokens 键。</div>';
+  box.innerHTML=html;
+}
+function renderCredState(v){
+  const box=document.getElementById('credBox');
+  const fb=document.getElementById('credFallback');
+  if(!box) return;
+  if(!v){ if(fb) fb.textContent=''; box.innerHTML='<div class="sub">没有数据</div>'; return; }
+  const f=v.fallback||{};
+  if(fb){
+    // The "helped" half is the only measurement of whether the coding plane can
+    // serve a model the harvest routed to the JWT lane, so it gets the sentence.
+    fb.textContent='双凭据回退：尝试 '+fmt(f.attempts||0)+' 次，成功换手 '+fmt(f.helped||0)+' 次'
+      +(f.last_plane?('，最近走的是 '+f.last_plane):'')+(f.last_at?('（'+f.last_at+'）'):'');
+  }
+  const rows=v.parked||[];
+  const reasonText={auth:'凭据被拒（需要重新登录）',rate:'被限流（会自动恢复）',
+    challenge:'需要验证码（会自动恢复）',transport:'上游没正常响应（会自动恢复）'};
+  const kindText={jwt:'plan JWT',key:'API key'};
+  if(!rows.length){ box.innerHTML='<div class="sub">两套凭据都正常，没有停用中的。</div>'; return; }
+  box.innerHTML=rows.map(r=>{
+    const kind=kindText[r.kind]||r.kind;
+    const why=reasonText[r.reason]||r.reason;
+    const hard=r.reason==='auth';
+    return '<div class="id-row"><span class="id-k">'+escHtml(kind)+'</span>'
+      +'<span class="id-v">'+escHtml(r.auth_id||'')+' · '+escHtml(why)+
+      ' · HTTP '+escHtml(String(r.status||0))+' · 连续 '+fmt(r.failures||0)+' 次 · '+
+      fmt(r.remaining||0)+' 秒后恢复'
+      +'<button style="margin-left:8px" data-cred-clear="1" data-auth="'+escHtml(r.auth_id||'')
+      +'" data-kind="'+escHtml(r.kind||'')+'">解除</button>'
+      +(hard?'<span class="id-warn" style="margin-left:8px">需要重新登录或手动解除</span>':'')
+      +'</span></div>';
+  }).join('');
+  // Wired after the markup rather than through an inline handler, so an auth_id
+  // containing a quote can never break out of the attribute.
+  box.querySelectorAll('button[data-cred-clear]').forEach(b=>{
+    b.onclick=()=>clearCredState(b.getAttribute('data-auth'),b.getAttribute('data-kind'));
+  });
+}
+async function clearCredState(authID,kind){
+  const r=await api('/cred_state/clear',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({auth_id:authID,kind:kind})});
+  if(r.error){ toast(r.error); return; }
+  toast('已解除 '+fmt(r.removed||0)+' 条');
+  load(false,false);
+}
+function renderClientScan(v){
+  const box=document.getElementById('clientBox');
+  const hint=document.getElementById('clientHint');
+  if(!box) return;
+  if(!v){ box.innerHTML='<div class="sub">扫描失败</div>'; return; }
+  if(hint) hint.textContent=v.enabled?'导入已启用':'导入未启用（import_client_credential=false）';
+  const row=(k,val,note)=>'<div class="id-row"><span class="id-k">'+escHtml(k)+'</span>'
+    +'<span class="id-v">'+(val?escHtml(val):'<i>'+(note||'（无）')+'</i>')+'</span></div>';
+  let html='';
+  if(!v.exists){
+    // "No client here" is the normal answer on most machines, so it reads as a
+    // fact with the path it looked at, not as a failure.
+    html+='<div class="sub">本机没有找到客户端配置文件。</div>'
+      +row('查找路径',v.path||'','')
+      +'<div class="sub" style="margin:8px 0 0">默认路径是 <code>~/'+escHtml(v.default_path||'')+'</code>；'
+      +'装了客户端但不在这个位置，就把 <code>client_data_dir</code> 指到 config.json 或它所在的目录。</div>';
+    box.innerHTML=html;
+    return;
+  }
+  html+=row('配置文件',v.path,'');
+  const rows=v.candidates||[];
+  if(rows.length){
+    html+='<div class="sub" style="margin:10px 0 4px">识别到的字段（只列键路径和长度，不显示值）：</div>';
+    html+=rows.map(r=>'<div class="id-row"><span class="id-k">'+escHtml(r.path)+'</span>'
+      +'<span class="id-v">'+escHtml(r.kind)+' <span style="color:var(--mut)">'+fmt(r.length)+' 字符</span></span></div>').join('');
+  } else {
+    html+='<div class="sub" style="margin:10px 0 0">这个文件里没有认出任何凭据字段。可能是客户端把凭据放在了别的地方，或者字段名和预期不同。</div>';
+  }
+  if(v.unreadable){
+    html+='<div class="id-warn">读不了：'+escHtml(v.unreadable)+'</div>';
+  }
+  if((v.problems||[]).length){
+    html+='<div class="id-warn">'+escHtml((v.problems||[]).join('；'))+'</div>';
+  }
+  const lanes=[];
+  if(v.has_jwt) lanes.push('plan JWT');
+  if(v.has_oauth) lanes.push('OAuth token');
+  html+=row('上游',v.provider?v.provider+'（来自'+v.provider_from+'）':'','');
+  html+=row('认出的凭据',lanes.join(' + '),'没有可用的凭据字段');
+  if(v.has_oauth===false&&v.has_jwt){
+    html+='<div class="id-warn">只有 plan JWT，没有 OAuth token。coding-plan key 必须用 OAuth token 去换，'
+      +'缺了它导进来也没法用——请在客户端里重新登录一次补齐。</div>';
+  }
+  if(v.importable){
+    if(v.enabled){
+      html+='<div style="margin-top:12px"><button onclick="importClientCredential(false)">导入这个凭据</button></div>';
+    } else {
+      html+='<div class="id-warn">凭据可以导入，但功能没开：在插件配置里把 <code>import_client_credential</code> 设为 true 即可。</div>';
+    }
+  }
+  box.innerHTML=html;
+}
+async function scanClientCredential(){
+  const box=document.getElementById('clientBox');
+  const hint=document.getElementById('clientHint');
+  if(box) box.innerHTML='<div class="sub">读取中…</div>';
+  if(hint) hint.textContent='';
+  const r=await api('/client_credential');
+  if(r.error){ if(box) box.innerHTML='<div class="sub">'+escHtml(r.error)+'</div>'; return; }
+  renderClientScan(r);
+}
+async function importClientCredential(overwrite){
+  if(!confirm('导入会用本机客户端的凭据新建一个账号。\n\n如果这个账号已经存在，会覆盖它当前的凭据。继续？')) return;
+  const r=await api('/client_credential/import',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({overwrite:!!overwrite})});
+  if(r.error){
+    // The one refusal worth offering a way forward: re-importing over a known
+    // account is legitimate (the client rotated its token), and the host has no
+    // auth-delete, so overwrite is the only route.
+    if(r.existing && confirm(r.error+'\n\n要覆盖吗？')) return importClientCredential(true);
+    toast(r.error); return;
+  }
+  toast('已导入 '+(r.name||''));
+  load(false,false);
+}
+function renderPlanes(p){
+  const box=document.getElementById('planeBox');
+  if(!box) return;
+  if(!p||!p.planes){ box.innerHTML='<div class="sub">暂无通道计数</div>'; document.getElementById('planeTotal').textContent=''; return; }
+  document.getElementById('planeTotal').textContent='共 '+fmt(p.total)+' 次请求';
+  const rows=p.planes.map(x=>{
+    const meta=x.last_at?('<span class="pl-meta">'+escHtml(x.last_at)+(x.last_auth?' · '+escHtml(x.last_auth):'')+'</span>'):'';
+    return '<div class="pl-row'+(x.hits?'':' pl-idle')+'">'
+      + '<div class="pl-hd"><b>'+escHtml(x.label)+'</b><span class="pl-n">'+fmt(x.hits)+'</span></div>'
+      + '<div class="pl-note">'+escHtml(x.note||'')+'</div>'+meta+'</div>';
+  }).join('');
+  const fb=p.fallback||{};
+  let fbHtml='<div class="pl-fb">编码平面被上游以「无资源包」拒绝后回退到 JWT 平面：<b>'+fmt(fb.activations)+'</b> 次';
+  if(fb.activations){ fbHtml+='<span class="pl-meta">最近 '+escHtml(fb.last_at||'')+(fb.last_auth?' · '+escHtml(fb.last_auth):'')+'</span>'; }
+  else { fbHtml+='（非零说明预路由漏判了某个模型的套餐归属）'; }
+  fbHtml+='</div>';
+  box.innerHTML='<div class="pl-grid">'+rows+'</div>'+fbHtml
+    +'<div class="sub" style="margin:8px 0 0">计数存在插件进程内存里，重启清零。</div>';
 }
 async function select(idx){
   const r = await api('/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auth_index:idx})});
@@ -220,6 +512,27 @@ async function loadOne(idx){
 async function switchPlan(idx, plan){
   const r = await api('/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auth_index:idx, plan:plan})});
   toast(r.ok?'已切换到 '+plan:(r.error||'失败')); load(false,false);
+}
+// Switching providers rewrites the stored credential (new API key resolved
+// against the target upstream), so unlike switchPlan it confirms first.
+// Nothing is written when resolution fails, so cancelling is always safe and
+// confirming is always reversible by switching back.
+// Lifts a risk-control pause or quarantine for one account. Account-wide by
+// design (see risk.go), so it resets the strike history too rather than only
+// shortening the current pause — a half-cleared state would re-pause on the
+// next single challenge.
+async function clearRisk(idx){
+  const r = await api('/risk/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auth_id:idx})});
+  toast(r.removed?('已解除 '+r.removed+' 条风控状态'):'该账号没有风控状态'); load(false,false);
+}
+async function switchProvider(idx, provider){
+  const label = (provider==='bigmodel')?'BigModel':'Z.AI';
+  if(!confirm('把该账号切换到 '+label+'？\n\n会用该账号存下的 '+label+' OAuth token 重新解析一把 key，成功才写入；失败则凭据保持原样。')) return;
+  toast('切换中…');
+  const r = await api('/provider',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auth_index:idx, provider:provider})});
+  if(r.ok){ toast(r.unchanged?('已经是 '+label):('已切到 '+label)); }
+  else { toast(r.error||'失败'); }
+  load(false,false);
 }
 function escHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 

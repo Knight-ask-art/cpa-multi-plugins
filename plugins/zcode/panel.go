@@ -5,6 +5,7 @@ package main
 import (
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -30,6 +31,14 @@ type zcAccount struct {
 	Credits   *creditsSummary  `json:"credits,omitempty"`
 	Cooling   []map[string]any `json:"cooling,omitempty"`
 	Error     string           `json:"error,omitempty"`
+	// CanSwitch lists the providers this account holds a stored OAuth token
+	// for. Empty means a switch would need a fresh login first (see
+	// swappableProviders).
+	CanSwitch []string `json:"can_switch,omitempty"`
+	// Risk is present only when the upstream risk-control gate has challenged
+	// this account (risk.go). Omitted for a healthy account so the card stays
+	// clean.
+	Risk *riskSummary `json:"risk,omitempty"`
 }
 
 // creditsSummary is the shared quota snapshot shape (panel + notes).
@@ -117,6 +126,8 @@ func buildDashboardEx(force, fetchQuota bool) map[string]any {
 			acct.UID = sa.Account.UID
 			acct.Provider = authProviderFor(sa)
 			acct.Plan = authPlanFor(sa)
+			acct.CanSwitch = swappableProviders(sa)
+			acct.Risk = riskSummaryForAuth(f.ID, sa)
 			acct.Cooling = cooldownSnapshotFor(f.ID)
 			if fetchQuota {
 				_, cr, errs := cachedAccountDetails(f.ID, sa, force)
@@ -183,6 +194,19 @@ func buildDashboardEx(force, fetchQuota bool) map[string]any {
 		"login_provider": loadedLoginProvider(),
 		"server_time":    time.Now().Format("2006-01-02 15:04:05"),
 		"summary":        sum,
+		// Which upstream plane actually served the traffic (plane_track.go).
+		// Rides /accounts so the panel needs no extra round trip.
+		"planes": planeSnapshot(),
+		// The effective fingerprint values (identity.go) — see
+		// identitySnapshotForPanel for why these are worth surfacing.
+		"identity": identitySnapshotForPanel(),
+		// The effective model namespace (model_policy.go): alias table, prefix
+		// and output ceiling, including entries that resolve to nothing.
+		"model_policy": modelPolicySnapshotForPanel(),
+		// Per-credential health (cred_state.go): which of an account's two
+		// credentials is parked, and how the dual-credential fallback has been
+		// doing. Rides /accounts so the card costs no extra round trip.
+		"cred_state": credStateSnapshotForPanel(),
 	}
 	if len(life) > 0 {
 		resp["lifecycle"] = life
@@ -297,8 +321,18 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodGet, Path: base + "/credits", Description: "Get real-time quota for one (auth_index query) or all accounts."},
 			{Method: http.MethodPost, Path: base + "/select", Description: "Select the active account card used for chat routing (body: {auth_index})."},
 			{Method: http.MethodPost, Path: base + "/plan", Description: "Switch an account's plan routing (body: {auth_index, plan: coding-plan|start-plan})."},
+			{Method: http.MethodPost, Path: base + "/provider", Description: "Move an account to the other coding-plane provider, re-resolving its API key from that provider's stored OAuth token (body: {auth_index, provider: zai|bigmodel}). Fails without writing when the token is absent."},
 			{Method: http.MethodGet, Path: base + "/cooldowns", Description: "List active per-(account, model) cooldown entries."},
 			{Method: http.MethodGet, Path: base + "/models", Description: "Full zcode model catalog for the panel's exclusion picker (PATCH the host's oauth-excluded-models.zcode key)."},
+			{Method: http.MethodGet, Path: base + "/planes", Description: "Per-upstream-plane request counters: how many sends rode zai-coding / bigmodel-coding / jwt-anthropic / off-peak, plus reactive JWT-plane fallback activations. In-memory (lost on restart)."},
+			{Method: http.MethodGet, Path: base + "/risk", Description: "Accounts the upstream risk-control gate (biz 3012) has challenged, with the strike count and the resulting pause. In-memory (lost on restart)."},
+			{Method: http.MethodGet, Path: base + "/identity", Description: "The effective fingerprint values (X-Platform, X-Os-Category, X-Os-Version, app version, title, locale, release channel) and which pin overrides are active. Read-only."},
+			{Method: http.MethodGet, Path: base + "/client_credential", Description: "Read-only scan of a locally installed ZCode client (client_data_dir, default ~/.zcode/v2/config.json): which credential fields were found, under which key path, and whether an import is possible. Never writes; available regardless of import_client_credential."},
+			{Method: http.MethodPost, Path: base + "/client_credential/import", Description: "Import the credential found by the scan: resolve the coding-plan key from the client's OAuth token and save the account (body: {overwrite}). Refuses when the account uid already exists unless overwrite is true. Requires import_client_credential=true."},
+			{Method: http.MethodGet, Path: base + "/model_policy", Description: "The effective model namespace: model_prefix, model_map (alias -> upstream id) and model_max_tokens, including mappings whose target is not in the pinned catalog. Read-only."},
+			{Method: http.MethodGet, Path: base + "/cred_state", Description: "Per-credential health (cred_state.go): every parked credential of every account (which of the account two credentials, why, until when, how many consecutive failures) plus the dual-credential fallback counters (attempts, helped, last_plane). In-memory (lost on restart)."},
+			{Method: http.MethodPost, Path: base + "/cred_state/clear", Description: "Un-park credentials (body: {auth_id, kind}; empty auth_id clears every account, empty kind clears both credentials of an account). Use after fixing a credential upstream."},
+			{Method: http.MethodPost, Path: base + "/risk/clear", Description: "Lift a risk-control pause or quarantine (body: {auth_id}; empty auth_id clears every account)."},
 			{Method: http.MethodPost, Path: base + "/cooldowns/clear", Description: "Clear cooldown for one account (auth_id) or one pair (auth_id + model)."},
 			{Method: http.MethodGet, Path: base + "/preview", Description: "List claimable trial plans (billing/preview) across accounts. Read-only."},
 			{Method: http.MethodPost, Path: base + "/claim", Description: "Claim one trial plan for one account with the panel-minted Aliyun captcha verify param (billing/claim). The captcha challenge runs in the panel page itself."},
@@ -320,8 +354,13 @@ func managementRegistration() managementRegistrationResponse {
 // same config the global page drives (no second truth); filter-
 // ExcludedModels already consumes it in model.static and model.for_auth.
 func handleModelCatalog() map[string]any {
-	models := make([]map[string]string, 0, 16)
-	for _, m := range zcodeModels() {
+	// The ADVERTISED catalog, not the bare one: the picker must offer the exact
+	// ids the operator sees in their client, since whatever they pick has to
+	// match filterExcludedModels. Offering bare ids under a configured prefix
+	// would let a pick silently exclude nothing.
+	catalog := decorateCatalog(zcodeModels())
+	models := make([]map[string]string, 0, len(catalog)+8)
+	for _, m := range catalog {
 		models = append(models, map[string]string{"id": m.ID, "name": m.Name})
 	}
 	group := map[string]any{
@@ -364,6 +403,22 @@ func handleManagement(raw []byte) ([]byte, error) {
 
 	base := loadedManagementBasePath() + "/plugins/" + providerName
 	switch {
+	case req.Method == http.MethodGet && path == base+"/planes":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, planeSnapshot()))
+	case req.Method == http.MethodGet && path == base+"/risk":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleRiskList(req)))
+	case req.Method == http.MethodGet && path == base+"/identity":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, identitySnapshotForPanel()))
+	case req.Method == http.MethodGet && path == base+"/model_policy":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, modelPolicySnapshotForPanel()))
+	case req.Method == http.MethodGet && path == base+"/cred_state":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, credStateSnapshotForPanel()))
+	case req.Method == http.MethodPost && path == base+"/cred_state/clear":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCredStateClear(req)))
+	case req.Method == http.MethodGet && path == base+"/client_credential":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleClientCredentialScan()))
+	case req.Method == http.MethodPost && path == base+"/client_credential/import":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleClientCredentialImport(req)))
 	case req.Method == http.MethodGet && path == base+"/accounts":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, buildDashboardEx(false, false)))
 	case req.Method == http.MethodPost && path == base+"/refresh":
@@ -374,12 +429,16 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleSelectAuth(req)))
 	case req.Method == http.MethodPost && path == base+"/plan":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handlePlanSwitch(req)))
+	case req.Method == http.MethodPost && path == base+"/provider":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleProviderSwitch(req)))
 	case req.Method == http.MethodGet && path == base+"/cooldowns":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCooldownList(req)))
 	case req.Method == http.MethodGet && path == base+"/models":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleModelCatalog()))
 	case req.Method == http.MethodPost && path == base+"/cooldowns/clear":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCooldownClear(req)))
+	case req.Method == http.MethodPost && path == base+"/risk/clear":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleRiskClear(req)))
 	case req.Method == http.MethodGet && path == base+"/preview":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handlePreviewList()))
 	case req.Method == http.MethodPost && path == base+"/claim":
@@ -401,9 +460,13 @@ func mutatingManagementPath(path string) bool {
 	case base + "/refresh",
 		base + "/select",
 		base + "/plan",
+		base + "/provider",
 		base + "/cooldowns/clear",
+		base + "/risk/clear",
+		base + "/cred_state/clear",
 		base + "/claim",
-		base + "/captcha_pool":
+		base + "/captcha_pool",
+		base + "/client_credential/import":
 		return true
 	}
 	return false
@@ -596,9 +659,260 @@ func handlePlanSwitch(req pluginapi.ManagementRequest) map[string]any {
 		if err := hostAuthPersistFn(name, raw); err != nil {
 			return map[string]any{"error": err.Error()}
 		}
+		// The dashboard caches `plan` per auth (cache.go, 45s TTL) and the
+		// light path overwrites acct.Plan from that cache — without this the
+		// card keeps showing the old plan, and `provider` (not cached) would
+		// flip while `plan` lagged, so the two badges disagree. The entitlement
+		// snapshot is plan-sensitive too: a start-plan credential routes
+		// wholesale to the anthropic plane, so a stale harvest is misleading.
+		invalidateAccountCredits(f.ID, sa.Account.UID)
+		clearStartPlane(sa.Account.UID)
+		// A plan switch moves the credential to a different gateway, so a
+		// risk-control pause earned on the other one no longer applies.
+		clearRiskForAuth(f.ID, sa)
+		// Same argument for the per-credential park (cred_state.go): the park
+		// outlives its cause exactly when the credential underneath changes.
+		clearCredStateForAuth(f.ID, sa)
 		return map[string]any{"ok": true, "auth_index": authIndex, "plan": plan}
 	}
 	return map[string]any{"error": "account not found", "auth_index": authIndex}
+}
+
+// handleProviderSwitch moves an account onto the other coding-plane provider.
+//
+// This is not a field flip. The provider is baked into the credential at
+// login: the key that rides the requests is resolved through a per-provider
+// business chain (auth_keyres.go — zai exchanges the OAuth token for a biz
+// token and hard-fails unless it comes back with a secretKey, bigmodel posts
+// the raw token to bigmodel.cn and copies the secret best-effort), and an
+// OAuth token is only valid on the chain that issued it. So the switch
+// resolves a FRESH key for the target provider from that provider's stored
+// token, and writes only after resolution succeeds — a failure leaves the
+// credential byte-identical, which is why this can be offered as a one-click
+// button rather than a confirm-then-hope.
+//
+// The on-disk file name is deliberately left alone. authFileNameFor embeds the
+// provider, so re-saving under the new name would create a SECOND file (the
+// host ABI has no auth-delete method) and leave two records for one identity.
+// The name is cosmetic on the paths that matter: handleParseAuth echoes the
+// host's FileName back and blanks ID, so the host derives its record id from
+// the path it already has and never sees the mismatch. A file called
+// zcode-zai-<uid>.json holding provider=bigmodel is ugly but inert.
+func handleProviderSwitch(req pluginapi.ManagementRequest) map[string]any {
+	var body struct {
+		AuthIndex string `json:"auth_index"`
+		Provider  string `json:"provider"`
+	}
+	_ = json.Unmarshal(req.Body, &body)
+	authIndex := strings.TrimSpace(body.AuthIndex)
+	if authIndex == "" {
+		return map[string]any{"error": "auth_index is required"}
+	}
+	want, ok := parseProviderArg(body.Provider)
+	if !ok {
+		return map[string]any{"error": "provider must be zai or bigmodel", "got": body.Provider}
+	}
+	files, err := hostAuthList()
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	for _, f := range files {
+		if f.AuthIndex != authIndex {
+			continue
+		}
+		sa, err := hostAuthGet(f.AuthIndex)
+		if err != nil {
+			return map[string]any{"error": err.Error()}
+		}
+		from := authProviderFor(sa)
+		if from == want {
+			return map[string]any{"ok": true, "auth_index": authIndex, "provider": want, "unchanged": true}
+		}
+		token := strings.TrimSpace(sa.Auth.AltOAuthTokens[want])
+		if token == "" {
+			// Either this credential predates the alt slot or the login poll
+			// carried only its own provider. Both are fixed the same way.
+			return map[string]any{
+				"error":         fmt.Sprintf("该账号没有存下 %s 的 OAuth token，无法原地切换；请用 login_provider=%s 重新登录一次（登录会把两家 token 都存下来）", want, want),
+				"auth_index":    authIndex,
+				"provider":      want,
+				"needs_relogin": true,
+			}
+		}
+		// Resolve before mutating: the old credential stays usable if the
+		// target chain rejects the token (expired, revoked, or wrong chain).
+		newKey, err := resolveCodingPlanKey(token, want)
+		if err != nil {
+			return map[string]any{
+				"error":      fmt.Sprintf("向 %s 解析 key 失败，凭据未改动：%v", want, err),
+				"auth_index": authIndex,
+				"provider":   want,
+			}
+		}
+
+		prevToken := sa.Auth.OAuthToken
+		sa.Auth.Provider = want
+		sa.Auth.AccessToken = newKey
+		sa.Auth.OAuthToken = token
+
+		// Park the outgoing provider's token so the switch is reversible
+		// without another trip through the browser.
+		alt := map[string]string{}
+		for k, v := range sa.Auth.AltOAuthTokens {
+			if k != want && strings.TrimSpace(v) != "" {
+				alt[k] = v
+			}
+		}
+		if prevToken != "" {
+			alt[from] = prevToken
+		}
+		if len(alt) == 0 {
+			alt = nil
+		}
+		sa.Auth.AltOAuthTokens = alt
+
+		note := displayNote(sa, nil, false)
+		phys, perr := hostAuthGetPhysicalFn(authIndex)
+		disabled := false
+		if perr == nil && phys != nil {
+			disabled = phys.Disabled
+			note = displayNoteWithPrev(sa, nil, disabled, noteCreditsFromJSON(phys.JSON))
+		}
+		raw, err := buildAuthFileJSON(sa, disabled, note, nil)
+		if err != nil {
+			return map[string]any{"error": err.Error()}
+		}
+		name, _ := resolveAuthFileTarget(sa, phys)
+		if err := hostAuthPersistFn(name, raw); err != nil {
+			return map[string]any{"error": err.Error()}
+		}
+		// Three caches keyed on state that just changed. The 45s credits
+		// cache also holds `plan`, which the light dashboard path trusts over
+		// its own read; the entitlement snapshot is provider-sensitive (a
+		// start-plan credential routes wholesale to the anthropic plane); and
+		// a per-model cooldown earned against the OLD upstream says nothing
+		// about the new one.
+		invalidateAccountCredits(f.ID, sa.Account.UID)
+		clearStartPlane(sa.Account.UID)
+		clearModelCooldown(cooldownAuthIDFor(sa), "")
+		// The gate inspects the request and the identity, both of which this
+		// switch just changed; a pause earned by the old upstream must not
+		// outlive it.
+		clearRiskForAuth(f.ID, sa)
+		// The provider is baked into the credential, so both credentials were
+		// just replaced; a park earned by the old ones is stale by definition.
+		clearCredStateForAuth(f.ID, sa)
+		return map[string]any{
+			"ok":                true,
+			"auth_index":        authIndex,
+			"provider":          want,
+			"previous_provider": from,
+			"file_name":         name,
+		}
+	}
+	return map[string]any{"error": "account not found", "auth_index": authIndex}
+}
+
+// identitySnapshotForPanel renders the EFFECTIVE identity values, so an
+// operator can see exactly what the plugin puts on the wire. The whole point of
+// the identity_* overrides is to correct a header, which is impossible while
+// the effective value is invisible — and the derived defaults are inferences
+// from the mirrored reference, so being able to compare them against a real
+// capture is the difference between a guess and a measurement.
+func identitySnapshotForPanel() map[string]any {
+	id := zcodeIdentity()
+	return map[string]any{
+		"app_version":     id.appVersion,
+		"source_title":    id.sourceTitle,
+		"referer":         id.referer,
+		"language":        id.language,
+		"timezone":        id.timezone,
+		"platform":        id.platformValue,
+		"os_category":     id.osCategory,
+		"os_version":      id.osVersion,
+		"release_channel": id.release,
+		// The one derived value that is routinely EMPTY and therefore worth
+		// flagging: a client on Windows/macOS always reports an OS version.
+		"os_version_missing": id.osVersion == "",
+		"device_mid_pinned":  id.deviceMid != "",
+		"session_id_pinned":  id.sessionID != "",
+		"trace_id_pinned":    id.traceID != "",
+	}
+}
+
+// handleRiskList serves the risk-control view: which accounts the gate has
+// challenged, how many strikes, and how long the pause runs.
+func handleRiskList(req pluginapi.ManagementRequest) map[string]any {
+	entries := riskSnapshotAll()
+	return map[string]any{
+		"entries":    entries,
+		"count":      len(entries),
+		"persistent": false,
+	}
+}
+
+// handleRiskClear lifts a pause or quarantine. An empty auth_id clears every
+// account — the escape hatch when the panel and the routing filter disagree
+// about an identifier, which is exactly when a per-account clear would fail
+// silently.
+func handleRiskClear(req pluginapi.ManagementRequest) map[string]any {
+	var body struct {
+		AuthID string `json:"auth_id"`
+	}
+	_ = json.Unmarshal(req.Body, &body)
+	authID := strings.TrimSpace(body.AuthID)
+	if authID == "" {
+		return map[string]any{"success": true, "removed": clearRisk("")}
+	}
+	// Resolve through the auth store so both identifier forms are cleared.
+	removed := clearRisk(authID)
+	if files, err := hostAuthList(); err == nil {
+		for _, f := range files {
+			if f.AuthIndex != authID && f.ID != authID {
+				continue
+			}
+			if sa, err := hostAuthGet(f.AuthIndex); err == nil {
+				removed += clearRiskForAuth(f.ID, sa)
+			}
+		}
+	}
+	return map[string]any{"success": true, "removed": removed}
+}
+
+// handleCredStateClear un-parks credentials by hand.
+//
+// This exists because a park is a GUESS about a failure that may not be about
+// the credential at all: a 401 that the operator has since fixed, an upstream
+// blip that looked like a rejection, or a credential rotated in a way the plugin
+// did not observe. The TTL eventually clears all of those, but waiting 30
+// minutes for a false positive is not a reasonable thing to ask.
+func handleCredStateClear(req pluginapi.ManagementRequest) map[string]any {
+	var body struct {
+		AuthID string `json:"auth_id"`
+		Kind   string `json:"kind"`
+	}
+	_ = json.Unmarshal(req.Body, &body)
+	authID := strings.TrimSpace(body.AuthID)
+	kind := credKind(strings.TrimSpace(body.Kind))
+	if kind != "" && kind != credKindJWT && kind != credKindKey {
+		return map[string]any{"error": "kind must be jwt, key or empty"}
+	}
+	if authID == "" {
+		return map[string]any{"success": true, "removed": clearAllCredState()}
+	}
+	// Resolve through the auth store so both identifier forms are cleared.
+	removed := clearCredState(authID, kind)
+	if files, err := hostAuthList(); err == nil {
+		for _, f := range files {
+			if f.AuthIndex != authID && f.ID != authID {
+				continue
+			}
+			if sa, err := hostAuthGet(f.AuthIndex); err == nil {
+				removed += clearCredStateForAuth(f.ID, sa)
+			}
+		}
+	}
+	return map[string]any{"success": true, "removed": removed}
 }
 
 // handleCreditsQuery returns real-time quota for one or all accounts.

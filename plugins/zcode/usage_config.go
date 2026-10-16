@@ -21,13 +21,23 @@ var (
 	loginProvider   = providerZai
 	loginProviderMu sync.RWMutex
 
-	// identity header values (see identity.go).
-	identityMu          sync.RWMutex
-	identityAppVersion  = ""
-	identitySourceTitle = ""
-	identityReferer     = ""
-	identityLanguage    = ""
-	identityTimezone    = ""
+	// identity header values (see identity.go). The first five shape the
+	// User-Agent / title / locale family; the rest exist because the DERIVED
+	// value is an inference from the mirrored reference source, and a
+	// fingerprint header is worth being able to correct without a rebuild.
+	identityMu             sync.RWMutex
+	identityAppVersion     = ""
+	identitySourceTitle    = ""
+	identityReferer        = ""
+	identityLanguage       = ""
+	identityTimezone       = ""
+	identityPlatform       = "" // X-Platform as a whole "platform-arch" string
+	identityOSCategory     = "" // X-Os-Category
+	identityOSVersion      = "" // X-Os-Version (Windows/macOS have no default)
+	identityReleaseChannel = "" // X-Release-Channel
+	identityDeviceMid      = "" // device id for NEW logins (empty = fresh UUID)
+	identitySessionID      = "" // pins x-session-id (empty = fresh UUID)
+	identityTraceID        = "" // pins x-zcode-trace-id (empty = fresh UUID)
 
 	// usageReportURL / usageReportKey: POST NDJSON to CPA-Manager-Plus
 	// /v0/management/usage/import (only path that reaches request monitoring;
@@ -40,6 +50,14 @@ var (
 	// write endpoints. When empty, plugin relies on host-side auth.
 	managementAPIKey   = ""
 	managementAPIKeyMu sync.RWMutex
+
+	// importClientCredential / clientDataDir back the local-client importer
+	// (client_import.go). OFF by default: reading another application's private
+	// state is something the operator opts into, not something a plugin does on
+	// its own initiative.
+	clientImportAllowed = false
+	clientDataDir       = ""
+	clientImportMu      sync.RWMutex
 )
 
 const defaultUsageReportURL = "http://127.0.0.1:18317/v0/management/usage/import"
@@ -51,18 +69,88 @@ func loadedLoginProvider() string {
 	return loginProvider
 }
 
+// clientImportEnabled reports whether the local-client importer may WRITE. The
+// read-only scan is deliberately not gated on it: the scan is how an operator
+// finds out whether importing is even possible on this machine.
+func clientImportEnabled() bool {
+	clientImportMu.RLock()
+	defer clientImportMu.RUnlock()
+	return clientImportAllowed
+}
+
+// loadedClientDataDir is the configured client path, empty when unset (the
+// per-user default then applies, see clientCredPath).
+func loadedClientDataDir() string {
+	clientImportMu.RLock()
+	defer clientImportMu.RUnlock()
+	return clientDataDir
+}
+
 // configure decodes plugin config from the lifecycle request.
+// identityConfigKeys is the full set of fingerprint override keys. Order is
+// irrelevant to correctness but the list is the single place a new key is
+// declared, so the decoder and the assignment in configure cannot drift.
+var identityConfigKeys = []string{
+	"identity_version",
+	"identity_source_title",
+	"identity_referer",
+	"identity_language",
+	"identity_timezone",
+	"identity_platform",
+	"identity_os_category",
+	"identity_os_version",
+	"identity_release_channel",
+	"identity_device_mid",
+	"identity_session_id",
+	"identity_trace_id",
+}
+
+// decodeIdentityConfig reads the identity_* keys from a plugin config, by key.
+// An absent key is simply missing from the result.
+//
+// TWO passes, deliberately. The YAML map understands flow style ({k: v}) and
+// JSON that a raw-line scan can never match; the line scan is what still works
+// when the payload is not YAML at all. The first five keys used to be read ONLY
+// by the line scan, so a flow-style or JSON config silently lost them — the map
+// pass is that bug's fix, and the line scan stays as the fallback for the
+// shapes the map cannot parse.
+func decodeIdentityConfig(configYAML []byte) map[string]string {
+	out := map[string]string{}
+	if m, ok := decodePluginConfigYAML(configYAML); ok {
+		for _, k := range identityConfigKeys {
+			if v, present := m[k]; present {
+				out[k] = configScalarString(v)
+			}
+		}
+	}
+	for _, rawLine := range strings.Split(string(configYAML), "\n") {
+		line := strings.TrimSpace(rawLine)
+		for _, k := range identityConfigKeys {
+			// The colon is part of the prefix, so identity_os_version is never
+			// matched by a longer key that merely starts with it.
+			if prefix := k + ":"; strings.HasPrefix(line, prefix) {
+				out[k] = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, prefix)), "\"'")
+			}
+		}
+	}
+	return out
+}
+
 func configure(raw []byte) {
 	nextLoginProvider := "" // sticky: empty = keep current (issue #24)
 	nextLifecycleAuto := true
 	nextMgmtKey := ""
 	cfgURL, cfgKey := "", ""
-	cfgVersion, cfgTitle, cfgReferer, cfgLang, cfgTz := "", "", "", "", ""
+	// identity_* is decoded separately so the decode is reachable without
+	// running configure — which starts the claim scheduler.
+	var idv map[string]string
+	var cfgYAML []byte
 	nextOffPeak := false
 	nextOffPeakMaxWait := time.Duration(0)
 	nextClaimAuto := true
 	nextClaimPlanID := ""
 	nextClaimPoll, nextClaimCooldown := 0, 0
+	nextImportClient, nextClientDir := false, ""
 
 	if len(raw) > 0 {
 		var req struct {
@@ -108,6 +196,12 @@ func configure(raw []byte) {
 						nextClaimCooldown = int(secs)
 					}
 				}
+				if v, present := m["import_client_credential"]; present {
+					nextImportClient = configScalarBool(v)
+				}
+				if v, present := m["client_data_dir"]; present {
+					nextClientDir = configScalarString(v)
+				}
 				if v, present := m["offpeak_max_wait"]; present {
 					if secs, perr := strconv.ParseInt(configScalarString(v), 10, 64); perr == nil && secs > 0 {
 						nextOffPeakMaxWait = time.Duration(secs) * time.Second
@@ -127,6 +221,13 @@ func configure(raw []byte) {
 				if strings.HasPrefix(line, "offpeak:") {
 					v := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "offpeak:")), "\"'")
 					nextOffPeak = v == "true" || v == "1" || v == "yes" || v == "on"
+				}
+				if strings.HasPrefix(line, "import_client_credential:") {
+					v := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "import_client_credential:")), "\"'")
+					nextImportClient = v == "true" || v == "1" || v == "yes" || v == "on"
+				}
+				if strings.HasPrefix(line, "client_data_dir:") {
+					nextClientDir = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "client_data_dir:")), "\"'")
 				}
 				if strings.HasPrefix(line, "offpeak_max_wait:") {
 					v := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "offpeak_max_wait:")), "\"'")
@@ -162,24 +263,18 @@ func configure(raw []byte) {
 						nextClaimCooldown = int(secs)
 					}
 				}
-				if strings.HasPrefix(line, "identity_version:") {
-					cfgVersion = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "identity_version:")), "\"'")
-				}
-				if strings.HasPrefix(line, "identity_source_title:") {
-					cfgTitle = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "identity_source_title:")), "\"'")
-				}
-				if strings.HasPrefix(line, "identity_referer:") {
-					cfgReferer = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "identity_referer:")), "\"'")
-				}
-				if strings.HasPrefix(line, "identity_language:") {
-					cfgLang = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "identity_language:")), "\"'")
-				}
-				if strings.HasPrefix(line, "identity_timezone:") {
-					cfgTz = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "identity_timezone:")), "\"'")
-				}
 			}
 		}
+		idv = decodeIdentityConfig(req.ConfigYAML)
+		cfgYAML = req.ConfigYAML
 	}
+
+	// The model namespace is decoded by its own function for the same reason
+	// identity_* is: it keeps the decode testable without running configure,
+	// which starts the claim scheduler. A reconfigure carrying no config_yaml
+	// decodes to the empty policy, matching how the identity overrides in the
+	// same situation fall back to their derived defaults.
+	configureModelPolicy(decodeModelPolicy(cfgYAML))
 
 	// Sticky (issue #24): only an explicit login_provider key moves the
 	// pointer; bare/foreign reconfigures keep whatever was configured.
@@ -193,12 +288,27 @@ func configure(raw []byte) {
 	lifecycleAuto = nextLifecycleAuto
 	lifecycleAutoMu.Unlock()
 
+	clientImportMu.Lock()
+	clientImportAllowed = nextImportClient
+	clientDataDir = nextClientDir
+	clientImportMu.Unlock()
+
 	identityMu.Lock()
-	identityAppVersion = cfgVersion
-	identitySourceTitle = cfgTitle
-	identityReferer = cfgReferer
-	identityLanguage = cfgLang
-	identityTimezone = cfgTz
+	// A key absent from the config decodes to "" and therefore keeps the
+	// derived default (identity.go) rather than clearing a previous value's
+	// intent — an empty override and a missing override mean the same thing.
+	identityAppVersion = idv["identity_version"]
+	identitySourceTitle = idv["identity_source_title"]
+	identityReferer = idv["identity_referer"]
+	identityLanguage = idv["identity_language"]
+	identityTimezone = idv["identity_timezone"]
+	identityPlatform = idv["identity_platform"]
+	identityOSCategory = idv["identity_os_category"]
+	identityOSVersion = idv["identity_os_version"]
+	identityReleaseChannel = idv["identity_release_channel"]
+	identityDeviceMid = idv["identity_device_mid"]
+	identitySessionID = idv["identity_session_id"]
+	identityTraceID = idv["identity_trace_id"]
 	identityMu.Unlock()
 
 	configureOffPeak(nextOffPeak, nextOffPeakMaxWait)

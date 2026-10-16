@@ -151,12 +151,16 @@ func postClaim(sa *storedAuth, planID, captchaParam, region string) claimOutcome
 		out.Message = "account has no plan JWT — re-run login"
 		return out
 	}
-	platform, arch := platformArch()
+	// One snapshot for both headers, so the app version and the platform
+	// string can never come from different config generations.
+	id := zcodeIdentity()
 	headers := map[string]string{
 		"Authorization":       "Bearer " + sa.Auth.JWT,
 		"Content-Type":        "application/json",
-		"X-ZCode-App-Version": zcodeIdentity().appVersion,
-		"X-Platform":          platform + "-" + arch,
+		"X-ZCode-App-Version": id.appVersion,
+	}
+	if id.platformValue != "" {
+		headers["X-Platform"] = id.platformValue
 	}
 	if strings.TrimSpace(captchaParam) != "" {
 		headers["X-Aliyun-Captcha-Verify-Param"] = captchaParam

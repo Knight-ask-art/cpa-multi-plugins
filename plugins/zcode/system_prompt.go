@@ -24,7 +24,7 @@
 //     the first user turn — the currentDate section wrapped in
 //     <system-reminder>…</system-reminder>
 //
-// The env values ride the same source as the identity headers (platformArch /
+// The env values ride the same source as the identity headers (zcodeIdentity /
 // osRelease) so the prompt's Platform/OS Version lines can never contradict
 // X-Platform/X-Os-Version — a mixed combination is a distinguisher no real
 // client produces.
@@ -36,7 +36,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -128,9 +127,11 @@ type startPlanEnvInfo struct {
 // algorithm verbatim (SHELL ?? ComSpec ?? "" → basename, else "unknown").
 // cwd is the process working directory — never "unknown" in real traffic.
 func resolveEnvPromptInfo() startPlanEnvInfo {
-	platform := runtime.GOOS
-	arch := runtime.GOARCH
-	release := osRelease()
+	// Same snapshot the identity headers are built from, so the prompt's
+	// Platform / OsVersion lines can never contradict X-Platform / X-Os-Version
+	// — including when an identity_* override is in play.
+	id := zcodeIdentity()
+	platform, arch, release := id.platform, id.arch, id.osVersion
 	parts := make([]string, 0, 3)
 	for _, p := range []string{platform, release, arch} {
 		if p != "" {

@@ -83,10 +83,10 @@ func fetchQuotaSnapshot(sa *storedAuth) (*creditsSummary, error) {
 	if strings.TrimSpace(sa.Auth.JWT) == "" {
 		return nil, fmt.Errorf("not logged in — no plan JWT (re-run login)")
 	}
-	platform, arch := platformArch()
+	id := zcodeIdentity()
 	q := url.Values{}
-	q.Set("app_version", zcodeIdentity().appVersion)
-	q.Set("platform", platform+"-"+arch)
+	q.Set("app_version", id.appVersion)
+	q.Set("platform", id.platformValue)
 	endpoint := zcodeAPIBase + "/zcode-plan/billing/balance?" + q.Encode()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -96,7 +96,7 @@ func fetchQuotaSnapshot(sa *storedAuth) (*creditsSummary, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+sa.Auth.JWT)
 	req.Header.Set("Accept", "application/json")
-	for k, v := range buildContextIdentityHeaders(zcodeIdentity(), sa.Auth.DeviceMid) {
+	for k, v := range buildContextIdentityHeaders(id, sa.Auth.DeviceMid) {
 		req.Header.Set(k, v)
 	}
 	resp, err := hostHTTPDo(req)

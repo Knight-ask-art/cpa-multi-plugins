@@ -41,6 +41,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -125,6 +126,48 @@ func normalizeProvider(p string) string {
 	default:
 		return providerZai
 	}
+}
+
+// parseProviderArg validates a provider supplied by an operator (management
+// body, not config). normalizeProvider deliberately folds anything it does not
+// recognize into zai, which is the right default for a login and the wrong
+// behaviour for a switch: a typo like "bigmodle" would silently move the
+// account to zai. Here an unrecognized spelling is an error.
+func parseProviderArg(p string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case providerZai, "z.ai", "api.z.ai", "zai-api":
+		return providerZai, true
+	case providerBigmodel, "bigmodel.cn", "big_model", "zhipu", "glm":
+		return providerBigmodel, true
+	}
+	return "", false
+}
+
+// swappableProviders lists the providers this account could move to right now:
+// the ones whose OAuth token we hold and which are not the provider already in
+// use.
+//
+// Empty is the normal case for any credential written before the alt slot
+// existed, and for one whose login poll carried only its own provider — see
+// captureAltOAuthTokens. The panel uses this to decide between offering the
+// switch and asking for a re-login, rather than letting the operator click
+// into an error.
+func swappableProviders(sa *storedAuth) []string {
+	if sa == nil {
+		return nil
+	}
+	active := authProviderFor(sa)
+	out := make([]string, 0, 2)
+	for _, cand := range []string{providerZai, providerBigmodel} {
+		if cand == active {
+			continue
+		}
+		if strings.TrimSpace(sa.Auth.AltOAuthTokens[cand]) == "" {
+			continue
+		}
+		out = append(out, cand)
+	}
+	return out
 }
 
 // normalizePlan maps any accepted spelling onto coding-plan | start-plan.
@@ -228,6 +271,60 @@ func accessTokenFromPoll(data *cliPollData, provider string) string {
 	return strings.TrimSpace(data.Zai.AccessToken)
 }
 
+// captureAltOAuthTokens collects the OTHER providers' OAuth tokens from the
+// same ready poll, keyed by provider, so a later switch can re-resolve a
+// coding-plan key without a second browser round trip.
+//
+// The poll carries one slot per provider (data.zai.access_token /
+// data.bigmodel.access_token) but a login pins exactly one of them, and only
+// the pinned slot survives into OAuthToken. Whether the other slot is even
+// populated is a server-side question the reference clients cannot answer:
+// each asks for one provider and reads one slot, so a single-provider poll and
+// a both-provider poll are indistinguishable from their code. We keep whatever
+// is there and let the switch path degrade to "re-login required" when it is
+// not. An OAuth token is only valid on the chain that issued it, so a token
+// from the wrong chain is worse than no token at all — hence the strict
+// provider match rather than a fallback to any non-empty slot.
+func captureAltOAuthTokens(data *cliPollData, active string) map[string]string {
+	alt := map[string]string{}
+	for _, c := range []struct{ provider, token string }{
+		{providerZai, strings.TrimSpace(data.Zai.AccessToken)},
+		{providerBigmodel, strings.TrimSpace(data.Bigmodel.AccessToken)},
+	} {
+		if c.provider == active || c.token == "" {
+			continue
+		}
+		alt[c.provider] = c.token
+	}
+	if len(alt) == 0 {
+		return nil
+	}
+	return alt
+}
+
+// loginPollSlots describes which provider slots a ready poll filled, as
+// "zai=len123 bigmodel=absent".
+//
+// Slot names and LENGTHS only — never the token value. This exists to settle a
+// question the panel cannot answer after the fact: an account that cannot
+// switch upstream is either "the poll never carried the other provider" (no
+// fix but re-login) or "we dropped it on the way in" (a bug here). The two
+// look identical from stored state once the credential has been written.
+func loginPollSlots(data *cliPollData) string {
+	parts := make([]string, 0, 2)
+	for _, c := range []struct{ name, token string }{
+		{providerZai, strings.TrimSpace(data.Zai.AccessToken)},
+		{providerBigmodel, strings.TrimSpace(data.Bigmodel.AccessToken)},
+	} {
+		if c.token == "" {
+			parts = append(parts, c.name+"=absent")
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=len%d", c.name, len(c.token)))
+	}
+	return strings.Join(parts, " ")
+}
+
 // buildStoredAuthFromPoll maps a ready poll payload onto storedAuth with the
 // RESOLVED chat credential (chatKey = coding-plan API key from
 // resolveCodingPlanKey; the poll's OAuth token is preserved in OAuthToken).
@@ -246,7 +343,11 @@ func buildStoredAuthFromPoll(data *cliPollData, provider, chatKey string) *store
 			JWT:         strings.TrimSpace(data.Token),
 			Provider:    provider,
 			Plan:        planCoding,
-			DeviceMid:   uuid.NewString(),
+			// resolveDeviceMid is the identity_device_mid pin, empty by
+			// default — a fresh UUID per login, which is what this has always
+			// done. See resolveDeviceMid for why a shared pin is opt-in.
+			DeviceMid:      firstNonEmpty(resolveDeviceMid(), uuid.NewString()),
+			AltOAuthTokens: captureAltOAuthTokens(data, provider),
 		},
 		Account: zcodeAccount{
 			UID:      uid,
@@ -338,6 +439,10 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	if accessToken == "" {
 		return nil, fmt.Errorf("%s login poll: response missing %s.access_token", lc.provider, lc.provider)
 	}
+	// Record the poll's slot shape once per login: whether the server returned
+	// the other provider's token decides whether this credential can switch
+	// upstream later, and nothing downstream can tell the two cases apart.
+	log.Printf("[zcode] login poll slots: provider=%s %s", lc.provider, loginPollSlots(data))
 	// Resolve the coding-plan API key BEFORE persisting: the poll's
 	// access_token is an OAuth token, not a chat credential. Both reference
 	// clients run this chain inside the login flow — failure fails the login

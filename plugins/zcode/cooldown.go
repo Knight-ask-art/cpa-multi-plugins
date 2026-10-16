@@ -92,14 +92,20 @@ func metadataModelName(metadata map[string]any, key string) string {
 	}
 }
 
-// normalizeCooldownModel maps any CPA-facing spelling ("zcode/glm-5.3") onto
-// the catalog key space the filter compares against.
+// normalizeCooldownModel maps any CPA-facing spelling ("zcode/glm-5.3", or an
+// alias like "gpt-4o") onto the key space the cooling filter compares against.
+//
+// Aliases resolve HERE, not just at the executor, because a cooldown is a fact
+// about an upstream (account, model) pair and the upstream never saw the alias.
+// Keying on the client-facing name would let a client asking for "gpt-4o" cool
+// only that spelling while the catalog kept offering glm-4.6 — same upstream,
+// same limit, same failure on the very next request.
 func normalizeCooldownModel(model string) string {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return ""
 	}
-	return stripProviderPrefix(model)
+	return resolveUpstreamModel(model)
 }
 
 var (
@@ -276,6 +282,14 @@ func cooldownSweepLocked(now time.Time) {
 // cooldown table. Account-level failures (hard quota exhaustion, invalid
 // credentials) stay with the existing lifecycle/status handling.
 func recordUpstreamFailure(authID, model string, status int, body string) {
+	// Risk control is booked against the ACCOUNT and before the model guard:
+	// the 3012 gate rejects ahead of model selection (risk.go), so the model on
+	// a 3012 says nothing about what failed, and cooling that one pair would
+	// send the executor after the next model in the catalog.
+	if isRiskControlBody(body) {
+		recordRiskControl(authID, model, riskControlCode)
+		return
+	}
 	model = normalizeCooldownModel(model)
 	if model == "" {
 		return

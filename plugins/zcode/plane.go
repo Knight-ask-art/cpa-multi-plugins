@@ -106,6 +106,31 @@ func startPlaneModelSet(uid string) map[string]struct{} {
 	return out
 }
 
+// clearStartPlane starts a fresh entitlement snapshot for one account, or for
+// every account when uid is empty. Returns how many entries were dropped.
+//
+// The cache is keyed by UID and holds model->plane entitlement harvested from
+// the billing buckets, with a 6-hour TTL and — until now — no way to expire it
+// early. That was survivable while a credential's identity never changed, but
+// anything that swaps a credential underneath an account (a provider switch, a
+// re-login with a different plan) leaves this table asserting entitlements the
+// new credential may not have. Callers that mutate a credential must call this.
+func clearStartPlane(uid string) int {
+	uid = strings.TrimSpace(uid)
+	startPlaneMu.Lock()
+	defer startPlaneMu.Unlock()
+	if uid == "" {
+		n := len(startPlaneModels)
+		startPlaneModels = map[string]*startPlaneEntry{}
+		return n
+	}
+	if _, ok := startPlaneModels[uid]; !ok {
+		return 0
+	}
+	delete(startPlaneModels, uid)
+	return 1
+}
+
 // modelRidesStartPlane reports whether this model's entitlement is known to
 // live on the JWT plane. Only coding-plan credentials consult the override —
 // start-plan credentials already route there wholesale.
@@ -142,7 +167,7 @@ func isNoResourcePackageError(status int, body string) bool {
 // startPlaneFallbackRoute builds the JWT anthropic route used by the
 // reactive fallback (same shape routeFor returns for start-plan).
 func startPlaneFallbackRoute() chatRoute {
-	return chatRoute{endpoint: startPlanAnthropicEndpoint, anthropic: true, applyHeaders: applyStartPlanChatHeaders}
+	return chatRoute{endpoint: startPlanAnthropicEndpoint, anthropic: true, applyHeaders: applyStartPlanChatHeaders, plane: planeJWTAnthropic}
 }
 
 // startPlaneFallbackBody decides and builds the JWT-lane retry for a failed
@@ -165,7 +190,92 @@ func startPlaneFallbackBody(sa *storedAuth, route chatRoute, status int, failBod
 	if err != nil {
 		return chatRoute{}, "", false
 	}
+	// The primary route was wrong about this model's entitlement; count it so
+	// the panel can show how often the proactive harvest missed.
+	recordPlaneFallback(sa)
 	return startPlaneFallbackRoute(), string(anthropicBody), true
+}
+
+// credKindForRoute names the credential a route actually carries. The off-peak
+// lane is the odd one: it is anthropic-dialect like the JWT lane, but its
+// headers authenticate with the resolved plan KEY plus a ticket (offpeak.go), so
+// a failure there says nothing about the JWT.
+func credKindForRoute(route chatRoute) credKind {
+	if route.anthropic && route.offPeakTicketID == "" {
+		return credKindJWT
+	}
+	return credKindKey
+}
+
+// credFallbackRoute builds the coding-plane OpenAI route used by the
+// dual-credential fallback: the OTHER credential of the same account, on the
+// endpoint its provider serves.
+func credFallbackRoute(sa *storedAuth) chatRoute {
+	plane := planeZaiCoding
+	if authProviderFor(sa) == providerBigmodel {
+		plane = planeBigmodelCoding
+	}
+	return chatRoute{endpoint: chatEndpointFor(sa), applyHeaders: applyChatHeaders, plane: plane}
+}
+
+// credFallbackBody decides and builds the API-key retry for a failed JWT-lane
+// chat — the mirror of startPlaneFallbackBody, in the opposite direction.
+//
+// THE QUESTION THIS CANNOT ANSWER. Whether the coding plane serves a model the
+// entitlement harvest routed to the JWT lane is not knowable from here: the
+// harvest records that a model's bucket capabilities name it, and a model can be
+// entitled on both planes, so the fallback is a one-shot bet rather than a
+// certainty. It is only taken for failures that are about the CREDENTIAL or the
+// GATEWAY rather than about entitlement (see credFailureFor), and the panel's
+// "helped" counter is what turns the bet into a measurement.
+//
+// Refused when:
+//   - the account is on the start-plan tier, which the coding plane does not
+//     serve at all (offpeak.go documents the same rejection);
+//   - the credential has no resolved key, so there is nothing to fall back TO;
+//   - the key is already parked (cred_state.go) — re-learning a known answer
+//     costs the caller a round trip;
+//   - the failure does not classify as credential-scoped.
+func credFallbackBody(hostID string, sa *storedAuth, route chatRoute, status int, failBody string, hdrs http.Header, origPayload []byte, model string, stream bool) (chatRoute, string, bool) {
+	if sa == nil || !route.anthropic || route.offPeakTicketID != "" {
+		return chatRoute{}, "", false
+	}
+	if authPlanFor(sa) == planStart {
+		return chatRoute{}, "", false
+	}
+	if strings.TrimSpace(sa.Auth.AccessToken) == "" || len(origPayload) == 0 {
+		return chatRoute{}, "", false
+	}
+	if credBlockedFor(hostID, sa, credKindKey) {
+		return chatRoute{}, "", false
+	}
+	challenged := false
+	if hdrs != nil {
+		challenged = startPlanCaptchaChallenge(status, strings.TrimSpace(hdrs.Get("x-aliyun-captcha-verify-param")), failBody)
+	}
+	if _, ok := credFailureFor(status, failBody, challenged); !ok {
+		return chatRoute{}, "", false
+	}
+	// The dialects differ, so the coding-plane body is rebuilt from the original
+	// payload rather than reused — same reason startPlaneFallbackBody rebuilds
+	// in the other direction.
+	body, err := buildChatBody(origPayload, model, stream)
+	if err != nil {
+		return chatRoute{}, "", false
+	}
+	recordCredFallback()
+	return credFallbackRoute(sa), body, true
+}
+
+// noteRouteFailure parks a credential after a SURFACED upstream answer. Only
+// real answers qualify: a body-build or parse failure never reaches this, and
+// must not, because it says nothing about the credential.
+func noteRouteFailure(hostID string, sa *storedAuth, route chatRoute, status int, failBody string) {
+	reason, ok := credFailureFor(status, failBody, false)
+	if !ok {
+		return
+	}
+	markCredFailureFor(hostID, sa, credKindForRoute(route), reason, status)
 }
 
 // tryStartPlaneStream performs ONE send on the JWT anthropic route. ok=false
@@ -184,6 +294,7 @@ func tryStartPlaneStream(sa *storedAuth, route chatRoute, body string) (*hostHTT
 		route.applyHeaders(req, sa, body)
 		return req, nil
 	}
+	recordPlaneHit(route.plane, sa)
 	stream, sc, hdrs, err := sendChatWithSigning(sa, buildReq)
 	if err != nil || sc >= 400 {
 		failBody := ""

@@ -366,6 +366,30 @@ func wbRegistration() registration {
 				{Name: "claim_plan_id", Type: pluginapi.ConfigFieldTypeString, Description: "Claim this plan_id only; empty claims the highest-priority preview. Default empty."},
 				{Name: "claim_poll_seconds", Type: pluginapi.ConfigFieldTypeString, Description: "Preview poll interval in seconds (default 300)."},
 				{Name: "claim_cooldown_seconds", Type: pluginapi.ConfigFieldTypeString, Description: "Backoff after a failed claim attempt in seconds (default 600)."},
+				// Identity / fingerprint overrides (identity.go). The previous
+				// five were parsed from config_yaml but never registered, so the
+				// host UI could not show or edit them; registering the whole set
+				// also makes the host preserve them when it rewrites config.
+				// Local-client credential import (client_import.go).
+				{Name: "import_client_credential", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Allow importing a credential from a ZCode client installed on THIS machine (its config.json), instead of the browser OAuth flow. Off by default: it reads another application's private state. The read-only scan on the panel works either way."},
+				{Name: "client_data_dir", Type: pluginapi.ConfigFieldTypeString, Description: "Where the ZCode client keeps its config: either the config.json itself or the directory holding it. Default (empty) is the per-user convention ~/.zcode/v2/config.json."},
+				{Name: "identity_version", Type: pluginapi.ConfigFieldTypeString, Description: "X-ZCode-App-Version and the User-Agent version. Default: the bundled client version. An invalid (non-printable-ASCII) value drops the header and falls the UA back to ZCode/unknown."},
+				{Name: "identity_source_title", Type: pluginapi.ConfigFieldTypeString, Description: "X-Title becomes \"Z Code@<value>\". Default cli."},
+				{Name: "identity_referer", Type: pluginapi.ConfigFieldTypeString, Description: "HTTP-Referer. Default https://zcode.z.ai."},
+				{Name: "identity_language", Type: pluginapi.ConfigFieldTypeString, Description: "X-Client-Language. Default unknown (the client's own fallback when locale detection fails)."},
+				{Name: "identity_timezone", Type: pluginapi.ConfigFieldTypeString, Description: "X-Client-Timezone. Default unknown."},
+				{Name: "identity_platform", Type: pluginapi.ConfigFieldTypeString, Description: "X-Platform and the billing/routing `platform` query param, as one \"platform-arch\" string. Default derives the client's (Node) vocabulary: on this host win32-x64. Set e.g. linux-x64 to present a different install."},
+				{Name: "identity_os_category", Type: pluginapi.ConfigFieldTypeString, Description: "X-Os-Category (windows | macos | linux). Default derived from identity_platform."},
+				{Name: "identity_os_version", Type: pluginapi.ConfigFieldTypeString, Description: "X-Os-Version. Default reads /proc/sys/kernel/osrelease, which exists only on Linux — on Windows/macOS the header is omitted unless set here, and a real client on those platforms does send one."},
+				{Name: "identity_release_channel", Type: pluginapi.ConfigFieldTypeString, Description: "X-Release-Channel (production | test). Default from the ZCODE_ENV env var."},
+				{Name: "identity_device_mid", Type: pluginapi.ConfigFieldTypeString, Description: "Device id given to NEW logins; empty (default) generates a fresh UUID per login. WARNING: one shared value makes every account look like the same machine, correlating accounts. Existing credentials are never rewritten."},
+				{Name: "identity_session_id", Type: pluginapi.ConfigFieldTypeString, Description: "Pins x-session-id. Empty (default) generates a fresh UUID per request. WARNING: a constant value across thousands of requests is a distinguisher no real client produces — use only to reproduce a specific capture. It also changes the V4 signature."},
+				{Name: "identity_trace_id", Type: pluginapi.ConfigFieldTypeString, Description: "Pins x-zcode-trace-id. Empty (default) generates a fresh UUID per request. Same warning as identity_session_id."},
+				// Model namespace + mapping (model_policy.go). These change what
+				// names the catalog advertises, not which models are served.
+				{Name: "model_prefix", Type: pluginapi.ConfigFieldTypeString, Description: "Namespace every catalog model id with this prefix, e.g. zcode -> zcode/glm-5.3. Useful when a front-end shows several providers that offer the same ids. Empty (default) advertises bare ids; bare ids keep working either way."},
+				{Name: "model_map", Type: pluginapi.ConfigFieldTypeString, Description: "Client-facing alias -> upstream model id. Either flat 'gpt-4o=glm-4.6, claude-3-5-sonnet=glm-5.3' or a nested YAML mapping. An alias is only offered while its target survives the plan/off-peak/cooldown/exclusion filters, and it never shadows a real model id. Panel shows any entry whose target is not in the catalog."},
+				{Name: "model_max_tokens", Type: pluginapi.ConfigFieldTypeString, Description: "Upper bound on max_tokens/max_completion_tokens sent upstream. Only ever LOWERS a value the client already set; a request that sets none keeps the upstream default. Empty (default) leaves the body untouched."},
 			},
 		},
 		Capabilities: registrationCapability{
@@ -410,6 +434,16 @@ type zcodeTokens struct {
 	Plan        string `json:"plan,omitempty"`       // coding-plan (default) | start-plan
 	DeviceMid   string `json:"deviceMid,omitempty"`  // stable per-account UUID (billing plane)
 	ExpiresAt   int64  `json:"expiresAt,omitempty"`  // 0 = unknown (permanent key)
+	// AltOAuthTokens holds the OTHER providers' login OAuth tokens, keyed by
+	// provider name, captured from the same ready poll that produced
+	// OAuthToken. An OAuth token is only valid on the business chain that
+	// issued it (auth_keyres.go: zai exchanges it for a biz token and demands
+	// a two-part secret, bigmodel posts it raw to bigmodel.cn), so moving an
+	// account to another upstream without a fresh browser round trip is only
+	// possible when the poll carried both tokens. Empty when it did not; the
+	// panel then reports that a re-login is required instead of offering a
+	// switch that cannot work.
+	AltOAuthTokens map[string]string `json:"altOAuthTokens,omitempty"`
 }
 
 type zcodeAccount struct {
@@ -442,19 +476,20 @@ func parseStored(raw []byte) (*storedAuth, error) {
 		}
 	} else {
 		var flat struct {
-			AccessToken string `json:"accessToken"`
-			JWT         string `json:"jwt"`
-			Provider    string `json:"provider"`
-			Plan        string `json:"plan"`
-			DeviceMid   string `json:"deviceMid"`
-			ExpiresAt   int64  `json:"expiresAt"`
-			UID         string `json:"uid"`
-			Nickname    string `json:"nickname"`
+			AccessToken    string            `json:"accessToken"`
+			JWT            string            `json:"jwt"`
+			Provider       string            `json:"provider"`
+			Plan           string            `json:"plan"`
+			DeviceMid      string            `json:"deviceMid"`
+			ExpiresAt      int64             `json:"expiresAt"`
+			AltOAuthTokens map[string]string `json:"altOAuthTokens"`
+			UID            string            `json:"uid"`
+			Nickname       string            `json:"nickname"`
 		}
 		if err := json.Unmarshal(raw, &flat); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
 		}
-		sa.Auth = zcodeTokens{AccessToken: flat.AccessToken, JWT: flat.JWT, Provider: flat.Provider, Plan: flat.Plan, DeviceMid: flat.DeviceMid, ExpiresAt: flat.ExpiresAt}
+		sa.Auth = zcodeTokens{AccessToken: flat.AccessToken, JWT: flat.JWT, Provider: flat.Provider, Plan: flat.Plan, DeviceMid: flat.DeviceMid, ExpiresAt: flat.ExpiresAt, AltOAuthTokens: flat.AltOAuthTokens}
 		sa.Account = zcodeAccount{UID: flat.UID, Nickname: flat.Nickname}
 	}
 	if sa.Auth.AccessToken == "" {
@@ -588,7 +623,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	upstreamModel := stripProviderPrefix(req.Model)
+	upstreamModel := resolveUpstreamModel(req.Model)
 	cooldownModel := requestModelForCooldown(req.Model, req.Metadata)
 	started := time.Now()
 	authUID := sa.Account.UID
@@ -662,6 +697,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	var statusCode int
 	var respHeaders http.Header
 	for attempt := 0; ; attempt++ {
+		recordPlaneHit(route.plane, sa)
 		stream, sc, hdrs, serr := sendChatWithSigning(sa, buildReq)
 		if serr != nil {
 			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, serr.Error())
@@ -729,10 +765,18 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		settled := false
 		if fbRoute, fbBody, ok := startPlaneFallbackBody(sa, route, statusCode, string(payload), req.Payload, upstreamModel, false); ok {
 			if fbPayload, fbSC, fbHdrs, fbFailBody, fbDone := tryStartPlaneSend(sa, fbRoute, fbBody); fbDone {
-				noteStartPlaneModel(authUID, upstreamModel)
+				// The entitlement memo only records where a model's bucket lives
+				// when the JWT lane actually served it; the off-peak lane says
+				// nothing about that (plane.go).
+				if fbRoute.anthropic && fbRoute.offPeakTicketID == "" {
+					noteStartPlaneModel(authUID, upstreamModel)
+				}
 				payload, statusCode, respHeaders, route = fbPayload, fbSC, fbHdrs, fbRoute
 				settled = true
 			} else if fbSC > 0 {
+				// Attempted and rejected: the retry lane's own answer is what
+				// gets surfaced, and it is also the answer worth parking on.
+				noteRouteFailure(req.AuthID, sa, fbRoute, fbSC, fbFailBody)
 				publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, fbSC, fbFailBody)
 				recordUpstreamFailure(req.AuthID, cooldownModel, fbSC, fbFailBody)
 				reconcileAfterExecutorError(req.AuthID, fbSC, fbFailBody)
@@ -750,6 +794,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 					payload, statusCode, respHeaders, route = crPayload, crSC, crHdrs, crRoute
 					settled = true
 				} else if crSC > 0 {
+					// Same call as the branch above: the captcha retry rides the
+					// JWT lane, so its rejection is a JWT-lane observation.
+					noteRouteFailure(req.AuthID, sa, crRoute, crSC, crFailBody)
 					publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, crSC, crFailBody)
 					recordUpstreamFailure(req.AuthID, cooldownModel, crSC, crFailBody)
 					reconcileAfterExecutorError(req.AuthID, crSC, crFailBody)
@@ -757,7 +804,32 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 				}
 			}
 		}
+		// Dual-credential fallback (cred_state.go / plane.go): LAST, because both
+		// attempts above keep the request on the lane it was routed to, while this
+		// one changes the credential AND the body dialect. It only runs for
+		// credential-scoped failures — quota and risk-control rejections belong to
+		// the account, and the other credential shares them (credFailureFor).
+		if !settled && route.anthropic {
+			if cbRoute, cbBody, ok := credFallbackBody(req.AuthID, sa, route, statusCode, string(payload), respHeaders, req.Payload, upstreamModel, false); ok {
+				if cbPayload, cbSC, cbHdrs, cbFailBody, cbDone := tryStartPlaneSend(sa, cbRoute, cbBody); cbDone {
+					payload, statusCode, respHeaders, route = cbPayload, cbSC, cbHdrs, cbRoute
+					// Served, but on the CODING lane — the entitlement memo must
+					// NOT be touched, or later calls would pre-route straight back
+					// to the lane that just failed.
+					noteCredFallbackHelped(cbRoute.plane)
+					settled = true
+				} else if cbSC > 0 {
+					noteRouteFailure(req.AuthID, sa, cbRoute, cbSC, cbFailBody)
+					publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, cbSC, cbFailBody)
+					recordUpstreamFailure(req.AuthID, cooldownModel, cbSC, cbFailBody)
+					reconcileAfterExecutorError(req.AuthID, cbSC, cbFailBody)
+					return nil, upstreamStatusError(cbSC, routeChatError(cbRoute, sa, cbSC, cbHdrs, cbFailBody))
+				}
+			}
+		}
 		if !settled {
+			// The credential that finally failed is the one to park.
+			noteRouteFailure(req.AuthID, sa, route, statusCode, string(payload))
 			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(payload))
 			recordUpstreamFailure(req.AuthID, cooldownModel, statusCode, string(payload))
 			reconcileAfterExecutorError(req.AuthID, statusCode, string(payload))
@@ -799,7 +871,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	upstreamModel := stripProviderPrefix(req.Model)
+	upstreamModel := resolveUpstreamModel(req.Model)
 	cooldownModel := requestModelForCooldown(req.Model, req.Metadata)
 	started := time.Now()
 	authUID := sa.Account.UID
@@ -860,6 +932,13 @@ func handleExecStream(raw []byte) ([]byte, error) {
 			if crRoute, ok := captchaRetryRoute(status, failBody, hdrs); ok {
 				return crRoute, body, true
 			}
+			// The account's other credential (cred_state.go). Its trigger is
+			// disjoint from the entitlement fallback below, which needs a
+			// no-resource-package rejection on the CODING plane while this one
+			// needs a credential-scoped failure on the JWT plane.
+			if cbRoute, cbBody, ok := credFallbackBody(req.AuthID, sa, route, status, failBody, hdrs, bodyRaw, upstreamModel, true); ok {
+				return cbRoute, cbBody, true
+			}
 			return startPlaneFallbackBody(sa, route, status, failBody, bodyRaw, upstreamModel, true)
 		}
 		chunks, statusCode, errCollect := collectUpstreamStream(body, sa, route, sseFramed, collector, upstreamModel, startPlaneFallback)
@@ -869,6 +948,9 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		if errCollect != nil {
 			publishUsage(req.Model, upstreamModel, authUID, started, collector.detail(), true, statusCode, errCollect.Error())
 			recordUpstreamFailure(req.AuthID, cooldownModel, statusCode, errCollect.Error())
+			// Credential parking for this path happens inside
+			// collectUpstreamStream, which is the only frame that knows WHICH
+			// lane the failing answer came from after a swap.
 			return nil, errCollect
 		}
 		publishUsage(req.Model, upstreamModel, authUID, started, collector.detail(), false, 0, "")
@@ -889,6 +971,9 @@ func handleExecStream(raw []byte) ([]byte, error) {
 			// re-translation, unlike the entitlement fallback below.
 			if crRoute, ok := captchaRetryRoute(status, failBody, hdrs); ok {
 				return crRoute, body, true
+			}
+			if cbRoute, cbBody, ok := credFallbackBody(req.AuthID, sa, route, status, failBody, hdrs, bodyRaw, upstreamModel, true); ok {
+				return cbRoute, cbBody, true
 			}
 			return startPlaneFallbackBody(sa, route, status, failBody, bodyRaw, upstreamModel, true)
 		}

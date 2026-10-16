@@ -160,6 +160,10 @@ func translateOpenAIToAnthropicBody(payload []byte, upstreamModel string, stream
 		return nil, err
 	}
 	applyStartPlanTransform(base, userSystem, upstreamModel, provider, deviceMid, now)
+	// LAST, after applyStartPlanTransform has folded any reasoning budget into
+	// max_tokens: clamping at the point the value is first chosen would let the
+	// budget push the total back over the ceiling.
+	clampAnthropicMaxTokens(base)
 	out, err := json.Marshal(base)
 	if err != nil {
 		return nil, err

@@ -84,6 +84,14 @@ func isSoftRateLimit(status int, body string) bool {
 	if status == 429 {
 		return true
 	}
+	// Business-code form of the same condition. The zcode family answers 429
+	// with {"error":{"code":"3002"}} rather than a prose message, and the
+	// overload codes below appear with statuses the executor does not map to
+	// 429 — so the text scan alone misses them.
+	switch extractBizErrorCode(body) {
+	case "3002", "1302", "1303", "1305", "1312":
+		return true
+	}
 	lower := strings.ToLower(body)
 	return strings.Contains(lower, "rate limit") ||
 		strings.Contains(lower, "too many requests") ||
@@ -204,6 +212,20 @@ func chatUpstreamError(status int, body string) error {
 	trimmed := truncateRedacted(body, 200)
 	if chatInputTooLarge(status, body) {
 		return fmt.Errorf("输入过大被上游拒绝（请求级问题，与账号无关）：请压缩上下文/清理会话后重试 — upstream %d: %s", status, trimmed)
+	}
+	// The business code carries the actionable part of a zcode rejection and the
+	// HTTP status usually does not: 3012 rides 405, which reads as "method not
+	// allowed" and sends you hunting a protocol bug that is not there. The
+	// anthropic plane has had this mapping from the start (startPlanBizError);
+	// the coding plane reached the same codes with no copy at all, so a
+	// risk-control rejection surfaced as a bare "upstream 405: {...}".
+	switch extractBizErrorCode(body) {
+	case riskControlCode:
+		return fmt.Errorf("上游风控拒绝 (3012 method not allowed)：这不是模型问题而是请求/身份不被风控层接受，换个模型重试会同样失败并累计打击；请检查伪装头配置后重试 — upstream %d: %s", status, trimmed)
+	case "3002":
+		return fmt.Errorf("触发限流 (3002)：可稍后重试 — upstream %d: %s", status, trimmed)
+	case "3001", "3005", "3006", "1005":
+		return fmt.Errorf("请求被上游拒绝 (%s)：请求参数或模型不可用 — upstream %d: %s", extractBizErrorCode(body), status, trimmed)
 	}
 	return fmt.Errorf("upstream %d: %s", status, trimmed)
 }

@@ -120,6 +120,7 @@ func pumpUpstreamStream(ctx context.Context, sa *storedAuth, route chatRoute, bo
 		defer cancel()
 	}
 
+	recordPlaneHit(route.plane, sa)
 	stream, statusCode, respHeaders, err := sendChatWithSigning(sa, buildReq)
 	if err != nil {
 		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
@@ -140,13 +141,23 @@ func pumpUpstreamStream(ctx context.Context, sa *storedAuth, route chatRoute, bo
 				if fbStream, fbSC, fbHdrs, fbFailBody, fbOK := tryStartPlaneStream(sa, fbRoute, fbBody); fbOK {
 					stream.Close()
 					stream, statusCode, respHeaders, route = fbStream, fbSC, fbHdrs, fbRoute
-					noteStartPlaneModel(authUID, upstreamModel)
+					// The fallback may land on the JWT lane (entitlement, plane.go)
+					// or on the CODING lane with the account's other credential
+					// (dual-credential fallback, cred_state.go). Only the former
+					// teaches an entitlement lesson; memoizing the latter would
+					// pre-route later calls back to the lane that just failed.
+					if fbRoute.anthropic && fbRoute.offPeakTicketID == "" {
+						noteStartPlaneModel(authUID, upstreamModel)
+					} else {
+						noteCredFallbackHelped(fbRoute.plane)
+					}
 					swapped = true
 				} else if fbSC > 0 {
-					// Attempted and rejected — the JWT plane's own answer wins.
+					// Attempted and rejected — the retry lane's own answer wins.
 					publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, fbSC, fbFailBody)
 					if authID != "" {
 						recordUpstreamFailure(authID, cooldownModel, fbSC, fbFailBody)
+						noteRouteFailure(authID, sa, fbRoute, fbSC, fbFailBody)
 					}
 					streamEmitError(streamID, routeChatError(fbRoute, sa, fbSC, fbHdrs, fbFailBody).Error())
 					stream.Close()
@@ -158,6 +169,8 @@ func pumpUpstreamStream(ctx context.Context, sa *storedAuth, route chatRoute, bo
 			publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errBody)
 			if authID != "" {
 				recordUpstreamFailure(authID, cooldownModel, statusCode, errBody)
+				// The credential that finally failed is the one to park.
+				noteRouteFailure(authID, sa, route, statusCode, errBody)
 			}
 			if authUID != "" {
 				go reconcileByUID(authUID, statusCode, errBody)
@@ -297,6 +310,7 @@ func collectUpstreamStream(body string, sa *storedAuth, route chatRoute, sseFram
 		route.applyHeaders(httpReq, sa, body)
 		return httpReq, nil
 	}
+	recordPlaneHit(route.plane, sa)
 	stream, statusCode, respHeaders, err := sendChatWithSigning(sa, buildReq)
 	if err != nil {
 		return nil, 0, fmt.Errorf("http_error: %w", err)
@@ -310,16 +324,24 @@ func collectUpstreamStream(body string, sa *storedAuth, route chatRoute, sseFram
 				if fbStream, fbSC, fbHdrs, fbFailBody, fbOK := tryStartPlaneStream(sa, fbRoute, fbBody); fbOK {
 					stream.Close()
 					stream, statusCode, respHeaders, route = fbStream, fbSC, fbHdrs, fbRoute
-					noteStartPlaneModel(sa.Account.UID, upstreamModel)
+					// Entitlement lesson only for the real JWT lane (see the pump).
+					if fbRoute.anthropic && fbRoute.offPeakTicketID == "" {
+						noteStartPlaneModel(sa.Account.UID, upstreamModel)
+					} else {
+						noteCredFallbackHelped(fbRoute.plane)
+					}
 					swapped = true
 				} else if fbSC > 0 {
-					// Attempted and rejected — the JWT plane's own answer wins.
+					// Attempted and rejected — the retry lane's own answer wins.
+					noteRouteFailure(cooldownAuthIDFor(sa), sa, fbRoute, fbSC, fbFailBody)
 					stream.Close()
 					return nil, fbSC, upstreamStatusError(fbSC, routeChatError(fbRoute, sa, fbSC, fbHdrs, fbFailBody))
 				}
 			}
 		}
 		if !swapped {
+			// The credential that finally failed is the one to park.
+			noteRouteFailure(cooldownAuthIDFor(sa), sa, route, statusCode, string(payload))
 			stream.Close()
 			return nil, statusCode, upstreamStatusError(statusCode, routeChatError(route, sa, statusCode, respHeaders, string(payload)))
 		}
