@@ -54,8 +54,23 @@ func modelGroupRegionLabel(region string) string {
 // modelGroupEntry is one catalog row. Name carries the display name when the
 // snapshot/discovery provided one.
 type modelGroupEntry struct {
+	// ID is the client-facing id (qwen3-8-flash). It is stable pre-exclusion.
 	ID   string `json:"id"`
 	Name string `json:"name,omitempty"`
+	// Facing is the id the model is actually registered under right now
+	// (v0.8.74). Upstream catalogs carry versioned names — the Intl side
+	// reports Qwen3.8-Flash, so the enabled model is qwen3-8-flash while a
+	// config list written against Qwen3-Flash says qwen3-flash. The panel
+	// must compare config entries against this, not against ID, or every
+	// re-save re-appends a stale spelling to the exclusion list.
+	Facing string `json:"facing,omitempty"`
+	// Upstream is the raw qoder key when ID is a localized id (v0.8.69):
+	// the panel tests/refreshes against the real upstream model.
+	Upstream string `json:"upstream,omitempty"`
+	// Hidden reports that the plugin's hidden_models list hides this model
+	// (v0.8.71). Hidden entries stay in the panel list — unchecked and
+	// tagged — so the admin can always see and restore them.
+	Hidden bool `json:"hidden,omitempty"`
 }
 
 // modelGroup is one region's catalog as the panel picker consumes it.
@@ -74,6 +89,14 @@ type modelGroup struct {
 type modelGroupsResponse struct {
 	Groups []modelGroup `json:"groups"`
 	Hint   string       `json:"hint"`
+	// Excluded is the host's oauth-excluded-models table for this plugin's
+	// keys (v0.8.74). The panel used to read it from the host with the access
+	// key and got "invalid management key", so it rendered every box as
+	// enabled and "saved" nothing.
+	Excluded map[string][]string `json:"excluded,omitempty"`
+	// ExcludedOK is false when the host refused the read (bad key, banned IP).
+	// The panel then refuses to save instead of rewriting the lists blindly.
+	ExcludedOK bool `json:"excluded_ok"`
 }
 
 // regionCatalogEntry is one credential's contribution to a region catalog scan.
@@ -122,21 +145,104 @@ func handleModelGroupsQuery(req pluginapi.ManagementRequest) (int, any) {
 	for _, region := range modelGroupRegionOrder {
 		groups = append(groups, buildModelGroup(region, perRegion[region], refresh))
 	}
+	// The exclusion lists live in config.yaml; the plugin reads it through
+	// the host API on every call so the panel never acts on a stale copy.
+	excl, exclOK := fetchHostExcludedModelsChecked(bearerOf(req))
 	return http.StatusOK, modelGroupsResponse{
-		Groups: groups,
-		Hint:   "勾选=启用；取消勾选保存后该模型从渠道注册列表移除。与 CPA 全局页驱动同一份 oauth-excluded-models 配置。",
+		Groups:     groups,
+		Hint:       "勾选=启用；取消勾选保存后该模型从渠道注册列表移除。与 CPA 全局页驱动同一份 oauth-excluded-models 配置。",
+		Excluded:   excl,
+		ExcludedOK: exclOK,
 	}
 }
 
 // buildModelGroup resolves one region's catalog: newest same-region snapshot
 // first; with refresh=1 a live discovery (via the for_auth chain) takes
 // precedence and re-stamps the snapshot. Never serves a cross-region snapshot.
+// fetchMergedCatalog is the static registration catalog (v0.8.69): every
+// qoder credential's served catalog, unioned by raw id, over the static
+// fallback table. Per-credential discovery is cached, so this costs one
+// discovery per credential per cache window.
+func fetchMergedCatalog() []pluginapi.ModelInfo {
+	out := wbModels()
+	seen := map[string]bool{}
+	for _, m := range out {
+		seen[strings.ToLower(m.ID)] = true
+	}
+	files, err := hostAuthListFiles()
+	if err != nil {
+		return out
+	}
+	prefix := providerName + "-"
+	for _, f := range files {
+		if !strings.HasPrefix(strings.ToLower(f.Name), prefix) {
+			continue
+		}
+		raw, err := hostAuthGetByIndex(f.AuthIndex)
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		for _, m := range fetchDynamicModelsFromStorage(raw) {
+			key := strings.ToLower(m.ID)
+			if seen[key] || m.ID == "" {
+				continue
+			}
+			seen[key] = true
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// hasUsableSnapshot reports whether any credential in the region carries a
+// non-empty catalog snapshot.
+func hasUsableSnapshot(entries []*regionCatalogEntry) bool {
+	for _, e := range entries {
+		if e.snapshot != nil && len(e.snapshot.Models) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func buildModelGroup(region string, entries []*regionCatalogEntry, refresh bool) modelGroup {
 	g := modelGroup{
 		Realm:       region,
 		Label:       modelGroupRegionLabel(region),
 		Models:      []modelGroupEntry{},
 		Credentials: len(entries),
+	}
+
+	// v0.8.69: an explicit refresh discovers live through any credential that
+	// can talk to upstream (localization needs display names, and discovery is
+	// the only source that carries them). The plain read path keeps the
+	// cheap snapshot-first behavior; it only falls through to a live
+	// discovery when the region has credentials but no usable snapshot at
+	// all — otherwise the panel rendered an empty region after a restart.
+	if pick := pickRefreshCredential(entries); pick != nil && (refresh || !hasUsableSnapshot(entries)) {
+		// v0.8.69: ask the DISCOVERY seam directly. The function-level ladder
+		// (fetchDynamicModelsFromStorage) also returns static guesses and
+		// persisted snapshots, which would defeat region isolation here — a
+		// live answer exists only if the upstream call succeeded.
+		sa, perr := parseStored(pick.storage)
+		var dyn []pluginapi.ModelInfo
+		var derr error
+		if perr == nil && sa != nil {
+			dyn, derr = callModelsAPIFn(sa)
+		}
+		if len(dyn) > 0 {
+			storeDynamicModels(modelCatalogAccountKey(sa), dyn)
+			persistModelSnapshot(pick.storage, region, dyn)
+			g.Models = modelGroupEntries(dyn)
+			g.Count = len(g.Models)
+			g.Source = "refreshed"
+			g.FetchedAt = time.Now().UTC().Format(time.RFC3339)
+			return g
+		}
+		_ = derr
+		g.Note = "刷新未获得模型（上游失败或凭证无效）；以下为最近一次落盘目录"
+	} else if refresh {
+		g.Note = "无可用凭证，无法实时刷新"
 	}
 
 	var best *persistedModelCache
@@ -148,24 +254,7 @@ func buildModelGroup(region string, entries []*regionCatalogEntry, refresh bool)
 			best = e.snapshot
 		}
 	}
-
-	if refresh {
-		if pick := pickRefreshCredential(entries); pick != nil {
-			models := fetchDynamicModelsFromStorage(pick.storage)
-			if len(models) > 0 {
-				g.Models = modelGroupEntries(models)
-				g.Count = len(g.Models)
-				g.Source = "refreshed"
-				g.FetchedAt = time.Now().UTC().Format(time.RFC3339)
-				return g
-			}
-			g.Note = "刷新未获得模型（上游失败或凭证无效）；以下为最近一次落盘目录"
-		} else {
-			g.Note = "无可用凭证，无法实时刷新"
-		}
-	}
-
-	if best != nil {
+	if best != nil && len(best.Models) > 0 {
 		g.Models = modelGroupEntries(best.Models)
 		g.Count = len(g.Models)
 		g.Source = "snapshot"
@@ -205,6 +294,8 @@ func pickRefreshCredential(entries []*regionCatalogEntry) *regionCatalogEntry {
 
 // modelGroupEntries projects ModelInfos into picker rows (id + display name).
 func modelGroupEntries(models []pluginapi.ModelInfo) []modelGroupEntry {
+	noteCatalogDisplays(models)
+	hiddenSet := hiddenRawSet()
 	out := make([]modelGroupEntry, 0, len(models))
 	for _, m := range models {
 		if m.ID == "" {
@@ -217,7 +308,15 @@ func modelGroupEntries(models []pluginapi.ModelInfo) []modelGroupEntry {
 		if strings.EqualFold(name, m.ID) {
 			name = ""
 		}
-		out = append(out, modelGroupEntry{ID: m.ID, Name: name})
+		// v0.8.69: with localize on, the display-name slug is the id clients
+		// and logs will see; the raw key stays the upstream model.
+		facing := localizeFacingFor(m.ID)
+		upstream := ""
+		if !strings.EqualFold(facing, m.ID) {
+			upstream = m.ID
+		}
+		out = append(out, modelGroupEntry{ID: facing, Name: name, Facing: facing, Upstream: upstream,
+			Hidden: hiddenSet[strings.ToLower(m.ID)] || hiddenSet[strings.ToLower(facing)]})
 	}
 	return out
 }

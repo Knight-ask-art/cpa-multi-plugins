@@ -28,7 +28,28 @@ import (
 // in front of the claim is idempotent (TodayCheckedIn / ALREADY_CLAIMED /
 // per-round probe latch), so the extra tick costs a status read per account
 // on the healthy path.
-var checkinHours = []int{10, 15, 21}
+//
+// v0.8.65 — 迟开窗补领 + 失败补领:
+//   - 10:03 joins: the list row appears a few minutes after the 10:00
+//     refresh (live 2026-10-12: 10:00:00 tick had no row, 10:04 claimed
+//     +100). The 10:00 tick keeps its window-retry; the 10:03 tick is the
+//     cheap second look when that retry already latched NOTHING_CLAIMABLE.
+//   - 10:30 joins: last same-morning compensation for accounts whose 10:00
+//     and 10:03 looks both came back empty (grant lag / late visibility).
+//   - 23:30 joins: final same-day catch-up, ~30 min before the round rolls
+//     over, so a day is never lost to transient 先到先得 exhaustion without
+//     a last attempt. Every extra tick is one status read on the healthy
+//     path (TodayCheckedIn short-circuits), so the cost stays negligible.
+var checkinHours = []int{10, 15, 21, 23}
+
+// extraCheckinTicks are the minute-offset compensation ticks that piggyback on
+// the hour loop: 10:03, 10:30 and 23:30. Scheduling lives in nextCheckinTime;
+// keep them here so the schedule has exactly one home.
+var extraCheckinTicks = []struct{ hour, minute int }{
+	{10, 3},
+	{10, 30},
+	{23, 30},
+}
 
 // plugin-level config decoded from plugin.register/reconfigure config_yaml.
 var (
@@ -109,6 +130,16 @@ func configure(raw []byte) {
 	nextCheckinAuto := true
 	nextLifecycleAuto := true
 	nextSchedulerMode := schedulerModeOff // reset to default on reconfigure
+	// localize_keep_originals defaults ON (v0.8.69): the host only routes ids
+	// the plugin registered, so dropping the raw keys would break clients
+	// still sending qfmodel. `localize_keep_originals: false` trims the list.
+	nextLocalize, nextLocalizeKeep, nextLocalizeSet := localizeEnabled(), true, false
+	var nextLocalizeOverrides, nextModelIDOverrides map[string]string
+	var nextHiddenModels []string
+	// v0.8.73: restart switches for the panel's model-id save. The script path
+	// is sticky — a reconfigure that omits the key keeps the last one.
+	nextRestartOnModelIDs := true
+	nextRestartScript := configuredRestartScript()
 	nextKeepaliveAuto := true
 	nextLoginRegion := ""  // sticky: empty = keep current (issue #24)
 	nextLoginDialect := "" // sticky: empty = keep current (v0.8.40)
@@ -147,6 +178,28 @@ func configure(raw []byte) {
 				if v, present := m["token_keepalive"]; present {
 					nextKeepaliveAuto = configScalarBool(v)
 				}
+				if v, present := m["localize"]; present {
+					nextLocalize = configScalarBool(v)
+					nextLocalizeSet = true
+				}
+				if v, present := m["localize_keep_originals"]; present {
+					nextLocalizeKeep = configScalarBool(v)
+				}
+				if v, present := m["models"]; present {
+					nextLocalizeOverrides = parseLocalizeOverrides(v)
+				}
+				if v, present := m["hidden_models"]; present {
+					nextHiddenModels = parseStringList(v)
+				}
+				if v, present := m["model_ids"]; present {
+					nextModelIDOverrides = parseModelIDTable(v)
+				}
+				if v, present := m["restart_on_model_ids"]; present {
+					nextRestartOnModelIDs = configScalarBool(v)
+				}
+				if v, present := m["restart_script"]; present {
+					nextRestartScript = configScalarString(v)
+				}
 				if v, present := m["scheduler_mode"]; present && configScalarString(v) == schedulerModeCredits {
 					nextSchedulerMode = schedulerModeCredits
 				}
@@ -181,6 +234,13 @@ func configure(raw []byte) {
 					v := strings.TrimSpace(strings.TrimPrefix(line, "lifecycle_auto:"))
 					v = strings.Trim(v, "\"'")
 					nextLifecycleAuto = v == "true" || v == "1" || v == "yes" || v == "on"
+				}
+				if strings.HasPrefix(line, "localize:") {
+					nextLocalize = parseBoolish(strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "localize:")), "\"'"))
+					nextLocalizeSet = true
+				}
+				if strings.HasPrefix(line, "localize_keep_originals:") {
+					nextLocalizeKeep = parseBoolish(strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "localize_keep_originals:")), "\"'"))
 				}
 				if strings.HasPrefix(line, "scheduler_mode:") {
 					v := strings.TrimSpace(strings.TrimPrefix(line, "scheduler_mode:"))
@@ -251,6 +311,23 @@ func configure(raw []byte) {
 	schedulerModeMu.Lock()
 	schedulerMode = nextSchedulerMode
 	schedulerModeMu.Unlock()
+
+	// v0.8.69: model localization. Only an explicit key moves the switch;
+	// bare reconfigures keep the last choice (defaults are true/false).
+	if nextLocalizeSet {
+		setLocalizeConfig(nextLocalize, nextLocalizeKeep, nextLocalizeOverrides)
+	}
+	// Panel edits persist in the plugin's own model_ids.json; config `model_ids`
+	// (if present) wins over the file.
+	if nextModelIDOverrides == nil {
+		nextModelIDOverrides = loadModelIDsFromDisk()
+	}
+	setModelIDOverrides(nextModelIDOverrides)
+	setHiddenModels(nextHiddenModels)
+	setRestartConfig(nextRestartOnModelIDs, nextRestartScript)
+	if s := modelIDOverridesSummary(); s != "" {
+		log.Printf("qoder: model_ids overrides %s", s)
+	}
 
 	keepaliveAutoMu.Lock()
 	keepaliveAuto = nextKeepaliveAuto

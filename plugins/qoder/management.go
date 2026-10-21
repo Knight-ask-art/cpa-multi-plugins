@@ -130,6 +130,11 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodGet, Path: base + "/cooldowns", Description: "List active per-(account, model) cooldown entries."},
 			{Method: http.MethodPost, Path: base + "/cooldowns/clear", Description: "Clear cooldown for one account (auth_id) or one pair (auth_id + model)."},
 			{Method: http.MethodGet, Path: base + "/models/groups", Description: "Per-region model catalog (model_cache snapshots; ?refresh=1 re-discovers) for the panel's exclusion picker."},
+			{Method: http.MethodPost, Path: base + "/model-ids", Description: "v0.8.72: set custom client-facing model ids ({model_ids:{raw_id:custom_id}}). v0.8.73: body may add restart:true to restart CPA so the host registers the new ids; the response carries restart_scheduled and the pre-restart pid."},
+			{Method: http.MethodGet, Path: base + "/status", Description: "v0.8.73: plugin/host process status (version, pid, uptime) + restart launcher readiness. The panel polls it after a restart and reloads when the pid changes."},
+			{Method: http.MethodGet, Path: base + "/exclusions", Description: "v0.8.74: the host's oauth-excluded-models entries for qoder / qoder-cn / qoder-intl, read by the plugin with the host's own secret-key."},
+			{Method: http.MethodPost, Path: base + "/exclusions", Description: "v0.8.74: set one key of that table ({provider, models}); an empty list removes the key."},
+			{Method: http.MethodPost, Path: base + "/exclusions/reset?realm=cn|intl", Description: "v0.8.74: remove one region's exclusion key entirely."},
 		},
 		Resources: []resourceRoute{
 			{Path: "/panel", Menu: "Qoder", Description: "Qoder dashboard (CN + Intl): credits, check-in, plan, import."},
@@ -156,7 +161,12 @@ func handleManagement(raw []byte) ([]byte, error) {
 	// (repeated auth failures from one IP). Authenticated requests must never
 	// be throttled — the panel's normal operation (checkin + reload + claim)
 	// can easily exceed 5 POSTs in quick succession.
-	if req.Method == http.MethodPost || mutatingManagementPath(path) {
+	base := loadedManagementBasePath() + "/plugins/" + providerName
+	// v0.8.74: the exclusion routes forward the caller's credential to the
+	// host, which is the authority on whether it is a management key — the
+	// host middleware already rejected every other key before the plugin ran.
+	panelRoute := path == base+"/exclusions" || path == base+"/exclusions/reset"
+	if !panelRoute && (req.Method == http.MethodPost || mutatingManagementPath(path)) {
 		ip := managementClientIP(req)
 		if status, msg := checkManagementAuth(req); status != 0 {
 			// Auth failed — consume a rate-limit token for this IP.
@@ -169,7 +179,6 @@ func handleManagement(raw []byte) ([]byte, error) {
 		}
 	}
 
-	base := loadedManagementBasePath() + "/plugins/" + providerName
 	switch {
 	case req.Method == http.MethodGet && path == base+"/accounts":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, buildDashboardEx(false, false)))
@@ -198,6 +207,14 @@ func handleManagement(raw []byte) ([]byte, error) {
 	case req.Method == http.MethodGet && path == base+"/models/groups":
 		status, payload := handleModelGroupsQuery(req)
 		return okEnvelope(mgmtJSONResponse(status, payload))
+	case req.Method == http.MethodPost && path == base+"/model-ids":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleModelIDs(req)))
+	case req.Method == http.MethodGet && path == base+"/status":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, pluginStatus()))
+	case req.Method == http.MethodGet && path == base+"/exclusions",
+		req.Method == http.MethodPost && (path == base+"/exclusions" || path == base+"/exclusions/reset"):
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleHostExclusions(req)))
+
 	}
 	return okEnvelope(mgmtJSONResponse(http.StatusNotFound, map[string]any{"error": "not found: " + path}))
 }
@@ -327,7 +344,9 @@ func mutatingManagementPath(path string) bool {
 		base + "/import",
 		base + "/select",
 		base + "/keepalive",
-		base + "/claim-pro":
+		base + "/claim-pro",
+		base + "/model-ids",
+		base + "/exclusions":
 		return true
 	}
 	return false

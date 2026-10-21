@@ -33,8 +33,10 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -62,6 +64,15 @@ const (
 	umidFetchTimeout       = 120 * time.Second
 	umidRetryCooldown      = 6 * time.Hour
 	umidProvisionerUAT     = "cpa-multi-plugins qoder umid-provision"
+
+	// v0.8.67: the official bridge is two files. runtime-info.exe loads its
+	// sibling sgsdk.dll (the Alibaba UMID SDK) at startup; without it the
+	// binary panics, the plugin falls back to the simulated identity and the
+	// device-targeted rows stay hidden. The npm bundle carries the DLL as a
+	// second blob (the ~7.3MB PE the 2MB size heuristic used to skip).
+	umidSdkName    = "sgsdk.dll"
+	umidSdkBlobMin = 2 * 1024 * 1024 // larger than the 400KB..2MB bridge itself
+	umidSdkBlobMax = 32 * 1024 * 1024
 )
 
 var (
@@ -76,6 +87,15 @@ var (
 	umidProvisionPath    string    // last successful install (process cache)
 	umidProvisionErr     string    // last failure text ("" when none)
 	umidProvisionAt      time.Time // last attempt (cooldown anchor)
+	umidRepairErr        string    // last bridge verification/repair failure
+
+	// umidBridgeProbeMu tracks the one-time health check of a bridge found on
+	// disk (probed) and whether it is unusable and needs re-provisioning
+	// (legacy).
+	umidBridgeProbeMu struct {
+		probed bool
+		legacy bool
+	}
 
 	// umidHTTPFetch is the single network touchpoint (test stub point).
 	umidHTTPFetch = umidHTTPFetchProd
@@ -136,19 +156,51 @@ func provisionedRuntimeInfo() string {
 	if p != "" {
 		return p
 	}
-	// fast path: a previous run of this binary already provisioned it
 	disk := umidProvisionedExePath()
 	if st, err := os.Stat(disk); err == nil && !st.IsDir() && st.Size() > umidBlobSizeMin {
-		umidProvisionStateMu.Lock()
-		umidProvisionPath = disk
-		umidProvisionStateMu.Unlock()
-		return disk
+		// v0.8.67: a provisioned bridge is only usable together with its
+		// sgsdk.dll. Health-check once per process; on failure try to repair
+		// the pair from a byte-identical official copy on disk (and, when the
+		// cache is incomplete, from the npm bundle in provisionUmidBridge).
+		umidProvisionRunMu.Lock()
+		probed := umidBridgeProbeMu.probed
+		umidProvisionRunMu.Unlock()
+		if !probed {
+			uid := umidProbeUID()
+			exe, ok := ensureProvisionedBridgeVerified(uid)
+			umidProvisionRunMu.Lock()
+			if ok {
+				umidProvisionStateMu.Lock()
+				umidProvisionPath = exe
+				umidProvisionStateMu.Unlock()
+			} else {
+				// The pair cannot be repaired from disk; drop the cached
+				// runtime-info so the npm provisioning leg gets a turn (it
+				// now installs the companion DLL too), keeping the disk pair
+				// intact until that leg succeeds.
+				umidBridgeProbeMu.probed = true
+				umidBridgeProbeMu.legacy = true
+			}
+			umidProvisionRunMu.Unlock()
+			if ok {
+				return exe
+			}
+		}
+		umidProvisionRunMu.Lock()
+		legacy := umidBridgeProbeMu.legacy
+		umidProvisionRunMu.Unlock()
+		if !legacy {
+			umidProvisionStateMu.Lock()
+			umidProvisionPath = disk
+			umidProvisionStateMu.Unlock()
+			return disk
+		}
 	}
 
 	umidProvisionRunMu.Lock()
 	defer umidProvisionRunMu.Unlock()
 	// re-check under the run lock: a concurrent attempt may have finished
-	if st, err := os.Stat(disk); err == nil && !st.IsDir() && st.Size() > umidBlobSizeMin {
+	if st, err := os.Stat(disk); err == nil && !st.IsDir() && st.Size() > umidBlobSizeMin && !umidBridgeProbeMu.legacy {
 		umidProvisionStateMu.Lock()
 		umidProvisionPath = disk
 		umidProvisionErr = ""
@@ -165,17 +217,31 @@ func provisionedRuntimeInfo() string {
 	exe, err := provisionUmidBridge()
 	umidProvisionStateMu.Lock()
 	umidProvisionAt = time.Now()
-	if err != nil {
-		umidProvisionErr = err.Error()
-	} else {
-		umidProvisionErr = ""
-		umidProvisionPath = exe
+	if err == nil {
+		// Provisioning itself is not proof the pair runs: verify before
+		// handing the bridge to the identity chain.
+		if umidBridgeWorks(exe, umidProbeUID()) {
+			umidProvisionErr = ""
+			umidProvisionPath = exe
+			umidProvisionStateMu.Unlock()
+			return exe
+		}
+		err = fmt.Errorf("provisioned bridge does not run (companion %s missing or wrong)", umidSdkName)
 	}
+	umidProvisionErr = err.Error()
 	umidProvisionStateMu.Unlock()
-	if err != nil {
-		return ""
+	return ""
+}
+
+// umidProbeUID is the account id used for identity health probes. Any
+// well-formed uid works: the bridge's machine identity is machine-level.
+const umidProbeUIDDefault = "00000000-0000-0000-0000-000000000000"
+
+func umidProbeUID() string {
+	if v := strings.TrimSpace(os.Getenv("QD_UMID_PROBE_UID")); v != "" {
+		return v
 	}
-	return exe
+	return umidProbeUIDDefault
 }
 
 // umidRegistryMeta is the slice of npm registry metadata we need.
@@ -383,6 +449,31 @@ func identifyUmidBlob(data []byte) string {
 // selectUmidBlob picks the component matching want: magic first, then the
 // 400KB..2MB heuristic (real bridges live there; the 7.3MB PE blob is some
 // other native module), smallest wins.
+// selectUmidSdkBlob picks the companion DLL blob for one GOOS/arch: the PE/DLL
+// component (magic-identified) within the SDK size window. The bridge binary
+// itself is already chosen by selectUmidBlob; the 2MB..32MB window and the
+// DLL magic keep the two apart.
+func selectUmidSdkBlob(blobs [][]byte, wantOS, wantArch string) []byte {
+	want := umidBlobLabelFor(wantOS, wantArch)
+	if want == "" {
+		// sgsdk ships as a Windows DLL; other platforms have no companion.
+		return nil
+	}
+	var best []byte
+	for _, b := range blobs {
+		if len(b) < umidSdkBlobMin || len(b) > umidSdkBlobMax {
+			continue
+		}
+		if identifyUmidBlob(b) != want {
+			continue
+		}
+		if best == nil || len(b) < len(best) {
+			best = b
+		}
+	}
+	return best
+}
+
 func selectUmidBlob(blobs [][]byte, want string) []byte {
 	if want == "" {
 		return nil
@@ -405,6 +496,190 @@ func selectUmidBlob(blobs [][]byte, want string) []byte {
 		}
 	}
 	return best
+}
+
+// recordUmidRepairError stores the last verification/repair failure so the
+// panel diagnostics can say why the bridge is not in use ("" clears it).
+func recordUmidRepairError(msg string) {
+	umidProvisionStateMu.Lock()
+	umidRepairErr = msg
+	umidProvisionStateMu.Unlock()
+}
+
+// umidRepairLastError returns the last repair failure ("" when none).
+func umidRepairLastError() string {
+	umidProvisionStateMu.Lock()
+	defer umidProvisionStateMu.Unlock()
+	return umidRepairErr
+}
+
+// umidSdkPath is the companion DLL the bridge loads from its own directory.
+func umidSdkPath() string {
+	return filepath.Join(umidProvisionDir(), umidSdkName)
+}
+
+// umidBridgeWorks runs the bridge with the official stdin dialect and reports
+// whether it answered with a complete identity. v0.8.67: a provisioned
+// runtime-info that panics on a missing sgsdk.dll (exit 101, "Failed to load
+// sgsdk.dll") used to be cached on disk forever and shadow every legitimate
+// attempt — the file is installed, yet every request silently falls back to
+// the simulated identity. Health-checking the pair turns that into a state the
+// plugin can repair.
+func umidBridgeWorks(exe, uid string) bool {
+	data := runRuntimeInfo(exe, uid)
+	if data == nil {
+		return false
+	}
+	return strings.TrimSpace(strField(data, "machineToken")) != "" &&
+		strings.TrimSpace(strField(data, "machineType")) != "" &&
+		strings.TrimSpace(strField(data, "machineCode")) != ""
+}
+
+// copyFileAtomic writes src to dst through a temp file + rename.
+func copyFileAtomic(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// findVerifiedRuntimeInfo searches the host for the official client's umid
+// directory — a runtime-info next to its sgsdk.dll — and returns the matching
+// DLL path. Order: QD_UMID_BIN's directory, the known client layouts, then a
+// shallow walk of the usual install roots. Every candidate must be
+// byte-identical to the bridge we will run (same build), which is why the
+// bridge's own hash is the primary key.
+func findVerifiedRuntimeInfo(bridgeExe string) (string, bool) {
+	bridgeSum, err := fileSha256(bridgeExe)
+	if err != nil {
+		return "", false
+	}
+	seen := map[string]bool{}
+	check := func(dir string) (string, bool) {
+		if dir == "" || seen[dir] {
+			return "", false
+		}
+		seen[dir] = true
+		exe := filepath.Join(dir, "runtime-info.exe")
+		dll := filepath.Join(dir, umidSdkName)
+		if _, err := os.Stat(exe); err != nil {
+			return "", false
+		}
+		if _, err := os.Stat(dll); err != nil {
+			return "", false
+		}
+		sum, err := fileSha256(exe)
+		if err != nil || sum != bridgeSum {
+			return "", false
+		}
+		return dll, true
+	}
+	if p := strings.TrimSpace(os.Getenv("QD_UMID_BIN")); p != "" {
+		if dll, ok := check(filepath.Dir(p)); ok {
+			return dll, true
+		}
+	}
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		// Official CN CLI bundle: ~/.qoder-cn/.bin/umid-<platform>-<hash>/
+		for _, root := range []string{filepath.Join(home, ".qoder-cn", ".bin"), filepath.Join(home, ".qoder", ".bin")} {
+			entries, err := os.ReadDir(root)
+			if err != nil {
+				continue
+			}
+			for _, e := range entries {
+				if !e.IsDir() || !strings.HasPrefix(e.Name(), "umid-") {
+					continue
+				}
+				if dll, ok := check(filepath.Join(root, e.Name())); ok {
+					return dll, true
+				}
+			}
+		}
+		// Desktop client layouts (launcher state.ini / Programs).
+		base := os.Getenv("LOCALAPPDATA")
+		if strings.TrimSpace(base) == "" {
+			base = filepath.Join(home, "AppData", "Local")
+		}
+		for _, name := range []string{"Qoder", "Qoder CN", "QoderCN"} {
+			for _, launcher := range []string{name + " Launcher", "Launcher"} {
+				if d := iniValue(filepath.Join(base, name, launcher, "state.ini"), "installDir"); d != "" {
+					if dll, ok := check(filepath.Join(d, "resources", "umid")); ok {
+						return dll, true
+					}
+				}
+			}
+			if dll, ok := check(filepath.Join(base, "Programs", name, "resources", "umid")); ok {
+				return dll, true
+			}
+		}
+	}
+	return "", false
+}
+
+func fileSha256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ensureProvisionedBridgeVerified returns the plugin-managed bridge only when
+// the runtime-info + sgsdk.dll pair actually runs. A bridge that is on disk but
+// broken (missing/incorrect DLL) is repaired from a verified official copy
+// when one exists; otherwise it reports false so the caller falls back to the
+// simulated identity instead of silently sending a broken one.
+func ensureProvisionedBridgeVerified(uid string) (string, bool) {
+	exe := umidProvisionedExePath()
+	if _, err := os.Stat(exe); err != nil {
+		return "", false
+	}
+	if umidBridgeWorks(exe, uid) {
+		return exe, true
+	}
+	dll, ok := findVerifiedRuntimeInfo(exe)
+	if !ok {
+		recordUmidRepairError("verified official copy not found (no runtime-info + " + umidSdkName + " pair on disk)")
+		return "", false
+	}
+	if err := copyFileAtomic(dll, umidSdkPath()); err != nil {
+		recordUmidRepairError("install " + umidSdkName + ": " + err.Error())
+		return "", false
+	}
+	recordUmidRepairError("")
+	if umidBridgeWorks(exe, uid) {
+		return exe, true
+	}
+	return "", false
 }
 
 // installUmidBridge atomically writes the component and marks it executable.
@@ -454,9 +729,42 @@ func provisionUmidBridge() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	blob := selectUmidBlob(scanUmidBlobs(text), want)
+	blobs := scanUmidBlobs(text)
+	blob := selectUmidBlob(blobs, want)
 	if blob == nil {
 		return "", fmt.Errorf("official bundle carries no %s component", want)
 	}
-	return installUmidBridge(blob)
+	exe, err := installUmidBridge(blob)
+	if err != nil {
+		return "", err
+	}
+	// v0.8.67: runtime-info.exe loads sgsdk.dll from its own directory and
+	// panics without it. Older versions installed only the bridge, which is
+	// why the provisioned identity never actually ran on this host. Install
+	// the companion when the bundle carries one; a bundle without it leaves
+	// the bridge unverifiable and provisionedRuntimeInfo reports it.
+	if sdk := selectUmidSdkBlob(blobs, runtime.GOOS, runtime.GOARCH); sdk != nil {
+		if err := installUmidSdkBridge(sdk); err != nil {
+			return "", fmt.Errorf("install %s: %w", umidSdkName, err)
+		}
+	}
+	return exe, nil
+}
+
+// installUmidSdkBridge atomically writes the companion DLL next to the bridge.
+func installUmidSdkBridge(data []byte) error {
+	dir := umidProvisionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	target := umidSdkPath()
+	tmp := target + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }

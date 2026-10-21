@@ -163,6 +163,12 @@ func TestModelGroupsCrossRegionIsolation(t *testing.T) {
 	restore := stubPersistSeams(t, map[string][]byte{"cn1": doc})
 	defer restore()
 
+	// v0.8.69: a region with credentials but no valid snapshot drops the
+	// cached snapshot and goes live; a failed discovery must still not leak
+	// the foreign snapshot back into the panel.
+	restoreDiscovery := stubDiscovery(t, func(*storedAuth) ([]pluginapi.ModelInfo, error) { return nil, errors.New("no catalog") })
+	defer restoreDiscovery()
+
 	_, payload := handleModelGroupsQuery(groupsTestRequest(url.Values{}))
 	groups := groupsByRegion(t, payload)
 

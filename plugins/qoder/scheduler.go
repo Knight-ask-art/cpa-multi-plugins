@@ -8,14 +8,21 @@ package main
 
 import (
 	"encoding/json"
+	"log"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-// Legacy config values kept for configure() compatibility; pick always uses
-// panel active-auth selection now (not credit-max ranking).
+// scheduler_mode values.
+//
+// v0.8.65: "credits" actually ranks by remaining credits now. Since v0.6.31
+// the mode only switched the plugin picker ON and then deferred to the
+// sticky panel selection — with two accounts that meant whichever card was
+// picked first kept ALL traffic until it hit zero (field report: the low pool
+// drained while the fuller one idled). The ranking is in pickCreditsAuth.
 const (
 	schedulerModeOff     = "off"
 	schedulerModeCredits = "credits"
@@ -89,24 +96,58 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	// Build thin view for active-auth picker.
+	// Build the ranking view: remaining credits per candidate.
 	cands := make([]activeAuthCandidate, 0, len(wbCandidates))
 	for _, c := range wbCandidates {
-		_, exhausted := cachedCreditsScore(c.ID)
+		remain, exhausted := cachedCreditsScore(c.ID)
+		if !exhausted {
+			exhausted = candidateExhausted(c)
+		}
 		cands = append(cands, activeAuthCandidate{
 			ID:        c.ID,
 			Disabled:  false, // already filtered
 			Exhausted: exhausted,
+			Remain:    remain,
 		})
 	}
-	picked := pickActiveAuth(cands)
+	// v0.8.65: rank by remaining credits. Accounts with a known positive pool
+	// compete on size (the panel selection stays while it is positive);
+	// accounts whose balance was never fetched follow the panel's own opinion
+	// (candidateExhausted) — an account the panel marks exhausted must never
+	// win on "unknown". A single live candidate keeps the panel selection, so
+	// the dashboard and the router never disagree.
+	picked := pickCreditsAuth(cands)
 	if picked == "" {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+	}
+	if picked != getActiveAuthID() {
+		setActiveAuthID(picked)
+		log.Printf("qoder: scheduler_mode=credits picked %s (remain=%s; candidates=%s)",
+			picked, creditsRankLabel(picked), creditsCandidateTrail(cands))
 	}
 	return okEnvelope(pluginapi.SchedulerPickResponse{
 		AuthID:  picked,
 		Handled: true,
 	})
+}
+
+// candidateExhausted reports host-side exhaustion (Status or metadata) for a
+// candidate whose credits were never fetched in this process. The panel's
+// snapshot goes through the same fields, so the router and the dashboard agree.
+func candidateExhausted(c pluginapi.SchedulerAuthCandidate) bool {
+	if strings.EqualFold(strings.TrimSpace(c.Status), "exhausted") {
+		return true
+	}
+	if c.Metadata == nil {
+		return false
+	}
+	switch t := c.Metadata["exhausted"].(type) {
+	case bool:
+		return t
+	case string:
+		return strings.EqualFold(strings.TrimSpace(t), "true")
+	}
+	return false
 }
 
 // candidateDisabled reports host-disabled auth from Status/metadata.
@@ -141,4 +182,26 @@ func cachedCreditsScore(authID string) (int64, bool) {
 		return -1, false
 	}
 	return entry.credits.TotalRemain, isCreditsExhausted(entry.credits)
+}
+
+// creditsRankLabel renders a candidate's cached remaining credits for logs.
+func creditsRankLabel(id string) string {
+	remain, _ := cachedCreditsScore(id)
+	if remain < 0 {
+		return "unknown"
+	}
+	return strconv.FormatInt(remain, 10)
+}
+
+// creditsCandidateTrail renders "id=remain" pairs for the decision log line.
+func creditsCandidateTrail(cands []activeAuthCandidate) string {
+	parts := make([]string, 0, len(cands))
+	for _, c := range cands {
+		r := "unknown"
+		if c.Remain >= 0 {
+			r = strconv.FormatInt(c.Remain, 10)
+		}
+		parts = append(parts, c.ID+"="+r)
+	}
+	return strings.Join(parts, ",")
 }

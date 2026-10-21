@@ -409,7 +409,9 @@ func filterExcludedModels(models []pluginapi.ModelInfo, host pluginapi.HostConfi
 	if len(host.ExcludedModels) == 0 {
 		return models
 	}
-	return applyExcludedSet(models, excludedModelsForKeys(host, providerName))
+	// v0.8.70: the list may be written in client-facing ids (qwen3-8-flash)
+	// or in the sync script's normalized raw keys; both must filter.
+	return applyExcludedSet(models, rawExcludedForHost(host, providerName))
 }
 
 // excludedModelsForKeys resolves the UNION of the oauth-excluded-models
@@ -484,7 +486,7 @@ func filterExcludedModelsForRegion(models []pluginapi.ModelInfo, host pluginapi.
 	if region == "" {
 		return filterExcludedModels(models, host)
 	}
-	return applyExcludedSet(models, excludedModelsForKeys(host, providerName, providerName+"-"+region))
+	return applyExcludedSet(models, rawExcludedForHost(host, providerName, providerName+"-"+region))
 }
 
 // publishUsage reports one upstream attempt into CPAMP request monitoring.
@@ -496,8 +498,15 @@ func handleModelStatic(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	cacheModelAliases(req.Host)
-	models := fetchDynamicModels()
+	// v0.8.69: merge every region's catalog here. This list is the provider's
+	// static registration — the host does not consult per-auth catalogs to
+	// decide which models a plugin owns, so the region-discovered ids
+	// (qmodel_38max, glm-5-3 …) used to disappear from /v1/models even though
+	// the plugin served them. The merged union is the plugin's real surface.
+	models := fetchMergedCatalog()
 	models = filterExcludedModels(models, req.Host)
+	// v0.8.69: publish display-name ids (qwen3-8-flash) instead of raw keys.
+	models = publishCatalog(models)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
 
@@ -519,5 +528,6 @@ func handleModelForAuth(raw []byte) ([]byte, error) {
 	} else {
 		models = filterExcludedModels(models, req.Host)
 	}
+	models = publishCatalog(models)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }

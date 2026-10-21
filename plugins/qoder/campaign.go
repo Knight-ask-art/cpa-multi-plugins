@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -799,6 +800,92 @@ func campaignTitle(c *campaign) string {
 // grant. v0.8.40: the check-in is now a MULTI-claim pass — an account may
 // hold a credits row AND a redemption row simultaneously, and claiming only
 // the first left the rest for a "tomorrow" that never came.
+// rowsNextOpenAt returns the earliest upcoming startAt among the visible
+// campaign rows — i.e. when a row the account can see becomes claimable
+// LATER TODAY (a timed activity). 0 means "nothing scheduled", which keeps
+// the scheduler's minute-offset compensation ticks as the only retry path.
+// Rows starting more than a day out are ignored: the next daily tick covers
+// them and a long sleep would just delay unrelated work.
+func rowsNextOpenAt(status *campaignStatusResponse, now time.Time) int64 {
+	if status == nil {
+		return 0
+	}
+	horizon := now.Add(24 * time.Hour).Unix()
+	var earliest int64
+	for i := range status.Campaigns {
+		c := &status.Campaigns[i]
+		start := c.StartAt
+		if start > 1e12 { // milliseconds epoch
+			start /= 1000
+		}
+		if start <= now.Unix() || start > horizon {
+			continue
+		}
+		if earliest == 0 || start < earliest {
+			earliest = start
+		}
+	}
+	return earliest
+}
+
+// scheduleCheckinRows is the v0.8.65 targeted compensation pass. After the
+// regular compensation ticks (10:03 / 10:30 / 23:30) all came back empty, a
+// row that is still closed but opens later today gives the scheduler a
+// precise retry instant; claiming at that instant is a single status read
+// plus the normal claim path. Verdicts reuse processAutoCheckinAccount, so
+// logging and panel state stay identical to a scheduled tick.
+func scheduleCheckinRows() {
+	checkinAutoMu.RLock()
+	doCheckin := checkinAuto
+	checkinAutoMu.RUnlock()
+	if !doCheckin {
+		return
+	}
+	files, err := hostAuthList()
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	var soonest time.Time
+	for _, f := range files {
+		sa, err := hostAuthGet(f.AuthIndex)
+		if err != nil {
+			continue
+		}
+		st, err := fetchCampaignStatus(sa)
+		if err != nil || st == nil {
+			continue
+		}
+		if claimedCampaign(st) != nil {
+			continue // already done for today
+		}
+		at := rowsNextOpenAt(st, now)
+		if at == 0 {
+			continue
+		}
+		t := time.Unix(at, 0)
+		if soonest.IsZero() || t.Before(soonest) {
+			soonest = t
+		}
+	}
+	if soonest.IsZero() {
+		return
+	}
+	delay := time.Until(soonest) + 45*time.Second // give the upstream a moment
+	if delay < time.Second {
+		delay = time.Second
+	}
+	if delay > 24*time.Hour {
+		return
+	}
+	log.Printf("qoder: checkin next row opens at %s — targeted compensation in %s",
+		soonest.Format("15:04"), delay.Round(time.Second))
+	time.AfterFunc(delay, func() {
+		log.Printf("qoder: checkin compensation tick (row opened at %s)", soonest.Format("15:04"))
+		runAutoCheckin()
+	})
+}
+
 func claimableCampaigns(status *campaignStatusResponse) []*campaign {
 	if status == nil {
 		return nil
@@ -1214,6 +1301,18 @@ func performCampaignCheckin(sa *storedAuth) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	// v0.8.65: a row window that opens later today is not "nothing to claim" —
+	// say so once and stop re-running the expensive probe ladder on every
+	// tick; the row-timed compensation pass (scheduleCheckinRows) claims it
+	// when it actually opens.
+	if at := rowsNextOpenAt(status, time.Now()); at != 0 && len(claimableCampaigns(status)) == 0 && claimedCampaign(status) == nil {
+		return map[string]any{
+			"success":      false,
+			"result":       "NOTHING_CLAIMABLE",
+			"message":      "今日权益窗口尚未开启（将于 " + time.Unix(at, 0).Format("15:04") + " 开启），到点会自动补领",
+			"next_open_at": at,
+		}, nil
+	}
 	// v0.8.40: the check-in is a MULTI-claim pass now. An account can
 	// hold a credits row (the daily +100) AND a coupon row at once, and
 	// claiming only the first stranded the rest. Claim every claimable
@@ -1289,6 +1388,12 @@ func performCampaignCheckin(sa *storedAuth) (map[string]any, error) {
 			"success": false,
 			"result":  "NOTHING_CLAIMABLE",
 			"message": diag,
+			// v0.8.65: carry the earliest instant the list itself says a
+			// retry can pay off (a row that opens later today). The
+			// scheduler uses it to wake for one targeted compensation tick
+			// instead of burning its minute-offset ticks on a row that is
+			// still closed — see scheduleCheckinRows.
+			"next_open_at": rowsNextOpenAt(status, time.Now()),
 		}, nil
 	}
 	earned := float64(0)

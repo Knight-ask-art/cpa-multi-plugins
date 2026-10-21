@@ -84,6 +84,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -204,15 +205,49 @@ func machineIdentityFor(region, uid string, force bool) machineIdentity {
 func computeMachineIdentity(region, uid string) machineIdentity {
 	if exe := runtimeInfoExePath(region); exe != "" {
 		if id := nativeMachineIdentityFrom(exe, uid); id != nil {
+			logIdentitySource("operator bridge", exe, "runtime-info")
 			return *id
 		}
+		// v0.8.67: a found-but-failing bridge (most often the client install
+		// without its sgsdk.dll companion) must not fail silently into the
+		// simulated path — say so once per source.
+		logIdentitySource("operator bridge", exe, "failed")
 	}
 	if exe := provisionedRuntimeInfo(); exe != "" {
 		if id := nativeMachineIdentityFrom(exe, uid); id != nil {
+			logIdentitySource("provisioned npm bridge", exe, "runtime-info")
 			return *id
 		}
+		logIdentitySource("provisioned npm bridge", exe, "failed")
 	}
+	logIdentitySource("", "", "derived")
 	return derivedMachineIdentity(uid)
+}
+
+// identitySourceLogOnce keeps the chain diagnostics to one line per source
+// per process: machineIdentityFor runs before every campaigns call, so an
+// unconditional log would flood the host log.
+var identitySourceLogOnce sync.Map
+
+func logIdentitySource(kind, exe, result string) {
+	key := kind + "|" + result
+	if _, loaded := identitySourceLogOnce.LoadOrStore(key, true); loaded {
+		return
+	}
+	switch result {
+	case "runtime-info":
+		log.Printf("qoder: machine identity via %s (%s)", kind, exe)
+	case "failed":
+		log.Printf("qoder: machine identity: %s at %s did not answer — falling back", kind, exe)
+	default:
+		msg := "qoder: machine identity: simulated fallback"
+		if last := umidProvisionLastError(); last != "" {
+			msg += " (bridge provisioning error: " + last + ")"
+		} else if rep := umidRepairLastError(); rep != "" {
+			msg += " (bridge repair: " + rep + ")"
+		}
+		log.Printf("%s", msg)
+	}
 }
 
 // nativeMachineIdentityFrom runs the official bridge once and maps its JSON

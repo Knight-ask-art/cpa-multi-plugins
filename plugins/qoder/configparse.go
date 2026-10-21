@@ -60,3 +60,29 @@ func configScalarBool(v any) bool {
 		return false
 	}
 }
+
+// findManagementSecret walks a decoded config document and returns
+// management.secret-key. configure() receives the whole config.yaml, but the
+// shape has changed across host versions (top-level "management", or nested
+// under "remote-management"/"cpa"), so every map is searched a few levels
+// deep before giving up.
+func findManagementSecret(m map[string]any) string {
+	if m == nil {
+		return ""
+	}
+	for _, k := range []string{"management", "remote-management", "remote_management", "cpa", "server", "api"} {
+		if sub, ok := m[k].(map[string]any); ok {
+			for _, sk := range []string{"secret-key", "secret_key", "secretKey", "key"} {
+				if v, ok := sub[sk]; ok {
+					if s := configScalarString(v); strings.HasPrefix(s, "$2") || len(s) >= 8 {
+						return s
+					}
+				}
+			}
+			if s := findManagementSecret(sub); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}

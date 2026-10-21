@@ -616,7 +616,11 @@ func cleanChunkJSON(s string) string {
 			}
 		}
 	}
-	if !changed {
+	// v0.8.64: align the cache view on the outgoing chunk (workbuddy 0.9.61
+	// parity) — host usage collectors read prompt_tokens_details.cached_tokens
+	// via gjson Exists(), so a hard-coded 0 there shadows the real hit for
+	// every consumer, /v1/messages (Claude Code) included.
+	if !alignCacheUsage(obj) && !changed {
 		return s
 	}
 	out, err := json.Marshal(obj)
@@ -658,8 +662,11 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		if v, ok := chunk["created"].(float64); ok {
 			created = int64(v)
 		}
-		if v, ok := chunk["usage"].(map[string]any); ok {
+		if v, ok := chunk["usage"].(map[string]any); ok && len(v) > 0 {
 			usage = v
+			// v0.8.64: align the cache view on the folded usage too — the
+			// non-stream path never passes through cleanChunkJSON.
+			alignCacheUsage(map[string]any{"usage": usage})
 		}
 		choices, _ := chunk["choices"].([]any)
 		for _, c := range choices {
@@ -737,6 +744,8 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		}},
 	}
 	if usage != nil {
+		// v0.8.64: same cache-view alignment as the streaming path.
+		alignCacheUsage(result)
 		result["usage"] = usage
 	}
 	out, err := json.Marshal(result)

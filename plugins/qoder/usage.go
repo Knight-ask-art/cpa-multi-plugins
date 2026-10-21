@@ -185,27 +185,17 @@ func usageDetailFromMap(m map[string]any) usage.Detail {
 		return usage.Detail{}
 	}
 	num := func(keys ...string) int64 {
-		for _, k := range keys {
-			if v, ok := m[k]; ok {
-				switch n := v.(type) {
-				case float64:
-					return int64(n)
-				case int64:
-					return n
-				case json.Number:
-					i, _ := n.Int64()
-					return i
-				}
-			}
-		}
-		return 0
+		return positiveNumberFrom(m, keys...)
 	}
 	d := usage.Detail{
-		InputTokens:     num("prompt_tokens", "input_tokens"),
-		OutputTokens:    num("completion_tokens", "output_tokens"),
-		TotalTokens:     num("total_tokens"),
-		CachedTokens:    num("cached_tokens"),
-		CacheReadTokens: num("cache_read_input_tokens"),
+		InputTokens:  num("prompt_tokens", "input_tokens"),
+		OutputTokens: num("completion_tokens", "output_tokens"),
+		TotalTokens:  num("total_tokens"),
+		// v0.8.64: cache-view rule shared with workbuddy 0.9.61 — several
+		// Qoder backends report the hit as prompt_cache_hit_tokens (or a read
+		// count in cache_read_input_tokens) while cached_tokens stays 0.
+		CachedTokens:    num("cached_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens"),
+		CacheReadTokens: num("cache_read_input_tokens", "cached_tokens", "prompt_cache_hit_tokens"),
 	}
 	if ct, ok := m["completion_tokens_details"].(map[string]any); ok {
 		if v, ok2 := ct["reasoning_tokens"].(float64); ok2 {
@@ -213,6 +203,76 @@ func usageDetailFromMap(m map[string]any) usage.Detail {
 		}
 	}
 	return d
+}
+
+// positiveNumberFrom returns the first positive value among keys, or 0.
+// Zero-valued keys never shadow a populated sibling.
+func positiveNumberFrom(m map[string]any, keys ...string) int64 {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			switch n := v.(type) {
+			case float64:
+				if n > 0 {
+					return int64(n)
+				}
+			case int64:
+				if n > 0 {
+					return n
+				}
+			case json.Number:
+				if i, err := n.Int64(); err == nil && i > 0 {
+					return i
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// alignCacheUsage rewrites an OpenAI-shaped "usage" object so the canonical
+// cache fields carry the value the upstream actually reported (workbuddy
+// 0.9.61 parity). An upstream that fills prompt_cache_hit_tokens — or a read
+// count in cache_read_input_tokens — while leaving cached_tokens /
+// prompt_tokens_details.cached_tokens at 0 would otherwise be recorded as a
+// full miss: CPA's collectors read cached_tokens through gjson Exists().
+// Absent keys are filled; reported positive values are never overwritten; a
+// genuine miss comes back untouched; token accounting is left alone.
+func alignCacheUsage(obj map[string]any) bool {
+	m, ok := obj["usage"].(map[string]any)
+	if !ok || len(m) == 0 {
+		return false
+	}
+	cached := positiveNumberFrom(m, "cached_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens")
+	if cached == 0 {
+		if d, ok := m["prompt_tokens_details"].(map[string]any); ok {
+			cached = positiveNumberFrom(d, "cached_tokens")
+		}
+	}
+	if cached == 0 {
+		return false
+	}
+	changed := false
+	for _, k := range []string{"cached_tokens", "cache_read_input_tokens"} {
+		if positiveNumberFrom(m, k) == 0 {
+			m[k] = cached
+			changed = true
+		}
+	}
+	details, _ := m["prompt_tokens_details"].(map[string]any)
+	if details == nil {
+		details = map[string]any{}
+		m["prompt_tokens_details"] = details
+		changed = true
+	}
+	if positiveNumberFrom(details, "cached_tokens") == 0 {
+		details["cached_tokens"] = cached
+		changed = true
+	}
+	if cd, ok := m["completion_tokens_details"].(map[string]any); ok && positiveNumberFrom(cd, "cached_tokens") == 0 {
+		cd["cached_tokens"] = cached
+		changed = true
+	}
+	return changed
 }
 
 // usageDetailFromCompletion extracts the usage block from an aggregated

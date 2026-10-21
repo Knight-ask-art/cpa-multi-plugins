@@ -124,8 +124,9 @@ func lifecycleActionFor(region string, cr *creditsSummary) lifecycleAction {
 	return lifecycleDisable
 }
 
-// shouldReenableCN is true when a CN account is disabled but now has credits.
-func shouldReenableCN(disabled bool, cr *creditsSummary) bool {
+// shouldReenable is true when a disabled account (any region since v0.8.68)
+// now has credits — the check-in restored the pool, or it was topped up.
+func shouldReenable(disabled bool, cr *creditsSummary) bool {
 	if !disabled {
 		return false
 	}

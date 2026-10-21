@@ -9,6 +9,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -116,7 +117,7 @@ func reenableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary) 
 	mu.Lock()
 	defer mu.Unlock()
 
-	if !shouldReenableCN(true, cr) {
+	if !shouldReenable(true, cr) {
 		return nil
 	}
 	note := displayNote(sa, cr, false)
@@ -308,6 +309,42 @@ func syncAuthNote(authIndex, authID string, sa *storedAuth, cr *creditsSummary, 
 // for cache keys (accountCache/lifecycleState) so it matches the scheduler's
 // SchedulerAuthCandidate.ID.
 // force ignores short-circuit only for credit fetch (uses force on cache via caller).
+// reenableFundedAccounts re-enables every disabled account whose credits are
+// back above zero (v0.8.68). reconcileOneAccount only visits enabled accounts
+// from the scheduled tick, so a disabled account that a check-in has just
+// funded — any region — would otherwise wait for a panel action.
+func reenableFundedAccounts() {
+	if !lifecycleEnabled() {
+		return
+	}
+	files, err := hostAuthList()
+	if err != nil {
+		return
+	}
+	for _, f := range files {
+		sa, phys, err := hostAuthGetBundle(f.AuthIndex)
+		if err != nil || phys == nil || !phys.Disabled {
+			continue
+		}
+		var pjson struct {
+			Note string `json:"note"`
+		}
+		if json.Unmarshal(phys.JSON, &pjson) == nil && pjson.Note != "" &&
+			(strings.Contains(pjson.Note, "SESSION-DEAD") || strings.Contains(pjson.Note, "TOKEN_EXPIRE")) {
+			continue
+		}
+		_, _, cr, _ := cachedAccountDetails(f.ID, sa, true)
+		if cr == nil || isCreditsExhausted(cr) || cr.TotalRemain <= 0 {
+			continue
+		}
+		if err := reenableAuth(f.AuthIndex, f.ID, sa, cr); err != nil {
+			log.Printf("qoder: lifecycle re-enable failed %s: %v", f.Name, err)
+			continue
+		}
+		log.Printf("qoder: lifecycle re-enabled %s (%d credits)", f.Name, cr.TotalRemain)
+	}
+}
+
 func reconcileOneAccount(authIndex, authID string, force bool) (action lifecycleAction, err error) {
 	if !lifecycleEnabled() {
 		return lifecycleNone, nil
@@ -347,7 +384,14 @@ func reconcileOneAccount(authIndex, authID string, force bool) (action lifecycle
 	}
 
 	region := authRegion(sa)
-	if region == regionCN && disabled {
+	// v0.8.68: a disabled account that just got credits back is re-enabled in
+	// EVERY region. The CN-only gate predates the campaigns check-in being
+	// the Intl contract too: an Intl account disabled for exhaustion stayed
+	// disabled forever even after its daily check-in credited it (live
+	// 2026-10-21: Intl 0 → 100 after the identity bridge was repaired, still
+	// disabled). SESSION-DEAD / TOKEN_EXPIRE notes still block re-enabling
+	// everywhere — those are revoked sessions, not quotas.
+	if disabled {
 		// Don't re-enable accounts marked session-dead by keepalive.
 		// The credits snapshot may still look healthy, but the session
 		// was revoked server-side — re-enabling would cause 401 storms.
@@ -360,7 +404,7 @@ func reconcileOneAccount(authIndex, authID string, force bool) (action lifecycle
 				return lifecycleNone, nil
 			}
 		}
-		if shouldReenableCN(true, cr) {
+		if shouldReenable(true, cr) {
 			if err := reenableAuth(authIndex, authID, sa, cr); err != nil {
 				return lifecycleReenable, err
 			}

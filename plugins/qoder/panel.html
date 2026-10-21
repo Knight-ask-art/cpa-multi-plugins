@@ -130,6 +130,15 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
 .mg-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:4px 12px;margin-top:8px}
 .mg-item{display:flex;gap:6px;align-items:center;font-size:13px;cursor:pointer;min-width:0}
 .mg-item input{accent-color:var(--acc)}
+.ml-row{display:grid;grid-template-columns:22px minmax(140px,1.2fr) minmax(120px,1fr) minmax(110px,1fr) auto;gap:8px;align-items:center;padding:4px 0;border-bottom:1px dashed var(--border);font-size:13px}
+.ml-row:last-child{border-bottom:0}
+.ml-row input[type=text]{width:100%;padding:3px 6px;border:1px solid var(--border);border-radius:6px;font-family:ui-monospace,monospace;font-size:12px;background:var(--surface);color:inherit}
+.ml-row .ml-raw{color:var(--mut);font-size:11px;font-family:ui-monospace,monospace}
+.ml-hd{display:grid;grid-template-columns:22px minmax(140px,1.2fr) minmax(120px,1fr) minmax(110px,1fr) auto;gap:8px;color:var(--mut);font-size:11px;padding-bottom:4px}
+.ml-changed input[type=text]{border-color:var(--acc)}
+.ml-auto{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:400;color:var(--mut);white-space:nowrap;cursor:pointer}
+.ml-auto input{accent-color:var(--acc)}
+#restartBanner{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:9999;display:none;align-items:center;gap:10px;padding:12px 18px;border:1px solid var(--border);border-radius:10px;background:var(--surface);box-shadow:0 8px 28px rgba(0,0,0,.28);font-size:13px}
 .mg-item.mg-locked{opacity:.6;cursor:default}
 .mg-note{color:var(--warn);font-size:12px;margin-top:6px}
 </style>
@@ -212,14 +221,31 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
         <button class="sec" onclick="modelCtlToggle(this)">收起</button>
       </span>
     </h2>
-    <div class="sub" style="margin:6px 0 10px">勾选=启用；取消勾选点「保存排除」后，该模型从对应渠道的注册列表移除。与 CPA 全局页同一份配置；被禁模型仍保留在列表中，可随时恢复。带「全局禁用」徽标的是被 qoder 全局键禁用的模型，请在 CPA 全局页处理。</div>
+    <div class="sub" style="margin:6px 0 10px">勾选=启用；取消勾选点「保存排除」后，该模型从对应渠道的注册列表移除。与 CPA 全局页同一份配置；被禁模型仍保留在列表中，可随时恢复。带「全局禁用」徽标的是被 qoder 全局键（不分渠道）禁用的模型，需在 CPA 全局页处理。</div>
     <div id="modelGroupsBox"><div class="loading">加载中…</div></div>
     <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <button onclick="modelGroupsSave(this)">保存排除</button>
-      <span class="toggle">改动写入 config.yaml 的 oauth-excluded-models.qoder-&lt;region&gt;，宿主热加载后数秒内生效</span>
+      <span class="toggle">保存由插件写入 config.yaml 的 oauth-excluded-models.qoder-&lt;region&gt;，宿主热加载后数秒内生效</span>
     </div>
   </div>
   <div id="grid" class="grid"><div class="loading">加载中…</div></div>
+  <div class="card" id="modelListCard" style="margin:14px 0 0">
+    <h2>模型列表 · 隐藏状态 · 对外 ID
+      <span style="display:flex;gap:6px;align-items:center">
+        <label class="ml-auto" title="保存后自动重启 CPA（约 20–30 秒），新 ID 才能被路由">
+          <input type="checkbox" id="autoRestartCPA"> 保存后自动重启 CPA
+        </label>
+        <button class="sec" onclick="modelListRefresh(this)" title="从上游实时拉取各渠道目录">刷新目录</button>
+        <button class="sec" onclick="modelIDSave(this)" title="把改过的对外 ID 写入插件状态（可自动重启 CPA）">保存对外 ID</button>
+      </span>
+    </h2>
+    <div class="sub" style="margin:6px 0 10px">
+      勾选「保存后自动重启 CPA」时：保存先把改动写入插件状态，再由插件重启 CPA（约 20–30 秒），本页会等新进程回来并自动刷新。
+      不勾选则只保存，需要手动重启后新 ID 才生效（宿主只在插件注册时读取模型目录）。
+      「已隐藏」= 插件 <code>hidden_models</code> 里的模型（在「模型禁用」里勾选保存即可恢复）；「已禁用」= 排除清单。
+    </div>
+    <div id="modelListBox"><div class="loading">加载中…</div></div>
+  </div>
 </div>
 <div class="modal-mask" id="importModal" onclick="onImportMaskClick(event)">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="importModalTitle">
@@ -238,6 +264,7 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
     </div>
   </div>
 </div>
+<div id="restartBanner"><span class="spin"></span><span class="t">CPA 正在重启…</span></div>
 <div class="toasts" id="toasts"></div>
 <script>
 const API = "/v0/management/plugins/qoder";
@@ -687,6 +714,9 @@ async function load(force, btn){
     bindCardActions(g);
     filterRegion(currentFilter, null);
     renderSummary(accounts);
+    // v0.8.72: the model list card lives below the account grid and stays
+    // visible (hidden models included) after every load.
+    modelListLoad(false);
     // Lazy-load credits for cards that don't have them yet.
     lazyLoadCredits(accounts);
     if(force){
@@ -931,17 +961,11 @@ async function importAuth(btn){
    保存：宿主 PATCH /v0/management/oauth-excluded-models 的 qoder-<region>
    子键 — 与 CPA 全局页同一份配置，无第二真相。被 qoder 全局裸键禁用的模型
    锁定显示（徽标），本面板只管渠道子键，避免跨键歧义。 */
-const HOST_API="/v0/management";
-let modelCtlLoaded=false,modelCtlOpen=false,modelGroupsData=null,modelExclMap=null;
-async function hostAPI(path,opts={}){
-  const k=getKey();
-  if(!k){showAuth();throw new Error("需要管理密钥")}
-  const r=await fetch(HOST_API+path,{...opts,credentials:'omit',headers:{...(opts.headers||{}),...authHeaders(k)}});
-  if(r.status===401){sessionStorage.removeItem(SS_KEY);showAuth();throw new Error("management key 无效")}
-  const text=await r.text();let d=null;try{d=JSON.parse(text)}catch(_){}
-  if(!r.ok)throw new Error((d&&d.error)||("宿主 API HTTP "+r.status));
-  return d;
-}
+let modelCtlLoaded=false,modelCtlOpen=false,modelGroupsData=null,modelExclMap=null,modelExclLoaded=false;
+/* v0.8.75: 排除清单仍走宿主 oauth-excluded-models（与 CPA 全局页同一份
+   配置），但面板的每个请求都必须带 CPA 管理密钥 —— 宿主中间件在插件之前
+   就拒绝了非管理密钥，且连续 5 次错误会封禁本机 IP ~30 分钟。api() 里已经
+   对 401/403 做了显式报错，这里不再另开一条请求通道。 */
 function modelCtlToggle(btn){
   const c=document.getElementById("modelCtlCard");
   modelCtlOpen=!modelCtlOpen;
@@ -949,12 +973,155 @@ function modelCtlToggle(btn){
   if(modelCtlOpen&&!modelCtlLoaded)modelCtlLoad();
   if(btn)btn.blur();
 }
+/* ===== 模型列表 / 对外 ID（v0.8.72）=====
+   常驻在账号卡片下方：列出每渠道全部模型，标出 hidden_models 隐藏项与排除项，
+   并允许直接编辑对外 ID（写插件配置 model_ids，宿主热加载后生效）。 */
+let modelListData=null, pendingModelIDs={}, modelListRaw={};
+function rawOf(realm,id){
+  const k=realm+"|"+id;
+  if(modelListRaw[k])return modelListRaw[k];
+  const groups=(modelListData&&modelListData.groups)||[];
+  for(const g of groups){if(g.realm!==realm)continue;for(const m of (g.models||[])){if((m.id||"")===id)return m.upstream||m.id||id}}
+  return id;
+}
+async function modelListLoad(refresh){
+  const box=document.getElementById("modelListBox");
+  if(!box)return;
+  box.innerHTML='<div class="loading">加载中…</div>';
+  try{
+    const g=await api("/models/groups"+(refresh?"?refresh=1":""));
+    modelListData=g;modelExclMap=(g&&g.excluded)||{};
+    renderModelList();
+  }catch(err){
+    box.innerHTML='<div class="row"><span class="v err">'+esc(err.message||String(err))+'</span></div>';
+  }
+}
+async function modelListRefresh(btn){busy(btn,true);try{await modelListLoad(true);toast("模型目录已刷新","ok","")}catch(e){toast("刷新失败","err",e.message)}busy(btn,false)}
+function renderModelList(){
+  const box=document.getElementById("modelListBox");
+  if(!box)return;
+  const groups=(modelListData&&modelListData.groups)||[];
+  if(!groups.length){box.innerHTML='<div class="row"><span class="v">没有渠道信息</span></div>';return}
+  const gset=globalExclSet();
+  box.innerHTML=groups.map(function(g){
+    const excl=new Set(realmExclList(g.realm));
+    const rows=(g.models||[]).map(function(m){
+      const id=m.id||"";
+      const up=m.upstream||"";
+      const raw=up||id;
+      modelListRaw[g.realm+"|"+id]=raw;
+      const hidden=!!m.hidden;
+      const excluded=excl.has(id.toLowerCase());
+      const locked=gset.has(id.toLowerCase());
+      const typed=pendingModelIDs[g.realm+"|"+id];
+      const cur=(typed!==undefined)?typed:id;
+      const changed=(typed!==undefined&&typed!==id);
+      const badge=locked?'<span class="badge disabled">全局禁用</span>'
+        :(excluded?'<span class="badge disabled">已禁用</span>'
+        :(hidden?'<span class="badge disabled">已隐藏</span>':'<span class="badge">启用中</span>'));
+      return '<div class="ml-row'+(changed?" ml-changed":"")+'">'
+        +'<span>'+(excluded||hidden||locked?"○":"●")+'</span>'
+        +'<span>'+esc(m.name||id)+'</span>'
+        +'<input type="text" value="'+esc(cur)+'" data-mlid="'+esc(g.realm)+'" data-mgid="'+esc(id)+'" data-mgraw="'+esc(raw)+'" placeholder="对外 ID" title="客户端看到的模型 id；改完点「保存对外 ID」">'
+        +'<span class="ml-raw">'+(up?"上游 "+esc(up):(hidden?"hidden_models":""))+'</span>'
+        +'<span>'+badge+'</span></div>';
+    }).join("");
+    return '<div class="mg-group"><div class="mg-hd"><b>'+esc(g.label)+'</b><span class="mg-meta">'+(g.count||0)+' 个模型'+(g.note?" · "+esc(g.note):"")+'</span></div>'
+      +'<div class="ml-hd"><span></span><span>模型</span><span>对外 ID</span><span>来源</span><span>状态</span></div>'+rows+'</div>';
+  }).join("");
+  box.querySelectorAll("input[data-mlid]").forEach(function(inp){
+    inp.addEventListener("input",function(){
+      const realm=inp.getAttribute("data-mlid"),id=inp.getAttribute("data-mgid"),raw=inp.getAttribute("data-mgraw");
+      pendingModelIDs[realm+"|"+id]=inp.value.trim();
+      const row=inp.closest(".ml-row");if(row)row.classList.toggle("ml-changed",inp.value.trim()!==raw);
+    });
+  });
+}
+/* ===== 保存后自动重启 CPA（v0.8.73）=====
+   宿主只在插件注册时读取模型目录，所以改过的对外 ID 必须重启 CPA 才能被路由。
+   勾选「保存后自动重启」时：保存 → 插件写 helper 脚本并脱离启动 → 本页轮询
+   /status，等 pid 变了再刷新，中间用底部横幅显示进度。 */
+const AUTORESTART_KEY="qoder.autoRestartCPA";
+function autoRestartOn(){
+  const el=document.getElementById("autoRestartCPA");
+  return el?!!el.checked:true;
+}
+(function initAutoRestart(){
+  const el=document.getElementById("autoRestartCPA");
+  if(!el)return;
+  let v=null;try{v=localStorage.getItem(AUTORESTART_KEY)}catch(_){}
+  el.checked=(v===null||v==="")?true:v==="1";
+  el.addEventListener("change",function(){try{localStorage.setItem(AUTORESTART_KEY,el.checked?"1":"0")}catch(_){}});
+})();
+function qdSleep(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function restartBanner(txt){
+  const el=document.getElementById("restartBanner");
+  if(!el)return;
+  if(txt===null){el.style.display="none";return}
+  el.style.display="flex";
+  const t=el.querySelector(".t");if(t)t.textContent=txt;
+}
+async function waitForCPA(oldPid){
+  restartBanner("CPA 正在重启…");
+  const t0=Date.now();
+  for(let i=0;i<150;i++){                 // ~5 分钟上限
+    await qdSleep(2000);
+    let d=null;
+    try{
+      const r=await fetch(API+"/status",{credentials:"omit",cache:"no-store",headers:authHeaders(getKey())});
+      if(r.ok)d=await r.json();
+    }catch(_){}
+    const secs=Math.round((Date.now()-t0)/1000);
+    if(d&&d.pid&&oldPid&&Number(d.pid)!==Number(oldPid)){
+      restartBanner("CPA 已重启（等待 "+secs+" 秒），正在刷新…");
+      await qdSleep(600);
+      location.reload();
+      return;
+    }
+    if(i>=2)restartBanner("CPA 正在重启… 已等待 "+secs+" 秒");
+  }
+  restartBanner("等待超时：CPA 没有在 5 分钟内回来");
+  toast("等待重启超时","err","请查看 CPA 终端输出，或手动运行 start-pebrel.ps1");
+}
+async function modelIDSave(btn){
+  const keys=Object.keys(pendingModelIDs);
+  if(!keys.length){toast("没有改动","warn","");return}
+  const wantRestart=autoRestartOn();
+  busy(btn,true);
+  try{
+    const body={};
+    keys.forEach(function(k){
+      const id=k.split("|")[1],raw=modelListRaw[k]||id;
+      if(raw&&pendingModelIDs[k])body[raw]=pendingModelIDs[k];
+    });
+    const r=await fetch(API+"/model-ids",{method:"POST",credentials:"omit",headers:{"Content-Type":"application/json",...(authHeaders(getKey()))},body:JSON.stringify({model_ids:body,restart:wantRestart})});
+    const d=await r.json().catch(function(){return null});
+    if(!r.ok)throw new Error((d&&d.error)||("HTTP "+r.status));
+    pendingModelIDs={};
+    if(d&&d.restart_scheduled){
+      restartBanner("CPA 即将重启…");
+      toast("对外 ID 已保存","ok","CPA 将在 "+Math.round((d.restart_in_ms||2500)/1000)+" 秒后重启（"+(d.restart_kind||"启动脚本")+"），页面会自动刷新");
+      await waitForCPA(d.pid);
+      return;
+    }
+    if(d&&d.restart_error){
+      toast("已保存，但自动重启失败","err",d.restart_error+"；请手动重启 CPA 后新 ID 才会生效");
+    }else if(d&&d.changed===false){
+      toast("对外 ID 未变化","ok","没有需要重启的改动");
+    }else{
+      toast("对外 ID 已保存","ok","改动已写入插件状态；未自动重启，CPA 重启后新 ID 生效");
+    }
+    await modelListLoad(false);
+  }catch(e){toast("保存失败","err",e.message)}
+  finally{busy(btn,false)}
+}
 async function modelCtlLoad(){
   const box=document.getElementById("modelGroupsBox");
   box.innerHTML='<div class="loading">加载中…</div>';
   try{
-    const [g,e]=await Promise.all([api("/models/groups"),hostAPI("/oauth-excluded-models")]);
-    modelGroupsData=g;modelExclMap=(e&&e["oauth-excluded-models"])||{};
+    const g=await api("/models/groups");
+    modelGroupsData=g;modelExclMap=(g&&g.excluded)||{};
+    modelExclLoaded=!!(g&&g.excluded_ok);
     modelCtlLoaded=true;
     renderModelGroups();
   }catch(err){box.innerHTML=`<div class="row"><span class="v err">${esc(err.message||String(err))}</span></div>`}
@@ -977,10 +1144,18 @@ function renderModelGroups(){
     const rows=(g.models||[]).map(m=>{
       const id=m.id||"";
       const locked=gset.has(id.toLowerCase());
-      const checked=!locked&&!excl.has(id.toLowerCase());
+      // v0.8.71: models hidden by the plugin's hidden_models list stay in
+      // the panel (unchecked, tagged) — previously they vanished entirely.
+      const hidden=!!m.hidden&&!locked;
+      // v0.8.74: also treat the id the model is registered under right now
+      // (m.facing) as excluded — config lists written before a versioned
+      // rename still spell the old slug.
+      const facing=(m.facing||id).toLowerCase();
+      const checked=!locked&&!hidden&&!excl.has(id.toLowerCase())&&!excl.has(facing);
       const label=m.name?`${esc(m.name)} <span style="color:var(--mut);font-size:11px">${esc(id)}</span>`:esc(id);
-      return `<label class="mg-item${locked?" mg-locked":""}" title="${locked?"已被 qoder 全局键禁用（CPA 全局页管理），此处锁定":"勾选=启用，取消勾选=禁用"}">
-        <input type="checkbox" data-mg="${esc(g.realm)}" value="${esc(id)}"${checked?" checked":""}${locked?" disabled":""}>${label}${locked?' <span class="badge disabled">全局禁用</span>':""}</label>`;
+      const tip=locked?"已被 qoder 全局键禁用（CPA 全局页管理），此处锁定":(hidden?"已被插件 hidden_models 隐藏（config.yaml）；勾选后保存即可恢复":"勾选=启用，取消勾选=禁用");
+      return `<label class="mg-item${locked?" mg-locked":""}" title="${tip}">
+        <input type="checkbox" data-mg="${esc(g.realm)}" value="${esc(id)}" data-facing="${esc(m.facing||id)}"${hidden?' data-hidden="1"':""}${checked?" checked":""}${locked?" disabled":""}>${label}${locked?' <span class="badge disabled">全局禁用</span>':""}${hidden?' <span class="badge disabled">已隐藏</span>':""}</label>`;
     }).join("");
     const meta=[];
     if(g.source==="refreshed")meta.push(`实时目录 ${g.count} 个`);
@@ -999,9 +1174,7 @@ async function modelGroupsRefresh(btn){
   try{
     const g=await api("/models/groups?refresh=1");
     modelGroupsData=g;
-    if(modelExclMap===null){
-      try{const e=await hostAPI("/oauth-excluded-models");modelExclMap=(e&&e["oauth-excluded-models"])||{}}catch(_){}
-    }
+    modelExclMap=(g&&g.excluded)||modelExclMap||{};
     renderModelGroups();
     const have=(g.groups||[]).filter(x=>x.count).length;
     toast("模型目录已刷新","ok",have+" 个渠道有目录");
@@ -1010,29 +1183,61 @@ async function modelGroupsRefresh(btn){
 }
 async function modelGroupsSave(btn){
   const groups=(modelGroupsData&&modelGroupsData.groups)||[];
-  if(!groups.length){toast("先刷新目录","warn");return}
+  if(!groups.length){toast("先点「刷新目录」","warn","");return}
+  // v0.8.74: saving against an unknown current list would rewrite the key to
+  // match whatever the checkboxes happen to show. Refuse instead of guessing.
+  if(!modelExclLoaded){
+    toast("读不到当前排除清单","err","插件无法访问宿主的 oauth-excluded-models（管理密钥无效或宿主拒绝）。请确认面板里填的是 CPA 管理密钥。");
+    return;
+  }
   busy(btn,true);
-  let saved=0;
   try{
+    const resp={};
     for(const g of groups){
       const realm=g.realm;
-      const checked=new Set([...document.querySelectorAll(`input[type=checkbox][data-mg="${realm}"]:checked`)].map(i=>i.value.toLowerCase()));
-      const keep=(g.models||[]).map(m=>m.id).filter(id=>!checked.has(id.toLowerCase()));
-      const keyExists=!!(modelExclMap&&modelExclMap["qoder-"+realm]);
-      if(keep.length===0){
-        if(!keyExists)continue;
-        await hostAPI("/oauth-excluded-models",{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({provider:"qoder-"+realm,models:[]})});
-        delete modelExclMap["qoder-"+realm];
-      }else{
-        await hostAPI("/oauth-excluded-models",{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({provider:"qoder-"+realm,models:keep})});
-        modelExclMap["qoder-"+realm]=keep;
-      }
+      const boxes=[...document.querySelectorAll(`input[type=checkbox][data-mg="${realm}"]`)];
+      if(!boxes.length)continue;
+      // A model stays enabled if it is checked; unchecked ones go on the list.
+      const excluded=[];
+      const seen=new Set();
+      boxes.forEach(function(b){
+        if(b.checked)return;
+        if(b.getAttribute("data-hidden"))return; // hidden_models, not this list
+        const key=b.value.toLowerCase();
+        if(seen.has(key))return;
+        seen.add(key);
+        excluded.push(b.getAttribute("data-facing")||b.value);
+      });
+      // v0.8.74: keep entries the catalog does not know (renamed/retired ids)
+      // instead of dropping them on every save.
+      const known=new Set(boxes.map(function(b){return b.value.toLowerCase()}));
+      known.add("");
+      (g.models||[]).forEach(function(m){known.add((m.facing||m.id||"").toLowerCase())});
+      ((modelExclMap&&modelExclMap["qoder-"+realm])||[]).forEach(function(x){
+        const k=String(x).toLowerCase();
+        if(!known.has(k)&&!seen.has(k)){seen.add(k);excluded.push(String(x))}
+      });
+      resp[realm]=excluded;
+    }
+    let saved=0, skipped=0;
+    for(const realm of Object.keys(resp)){
+      const list=resp[realm];
+      const d=await api("/exclusions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({provider:"qoder-"+realm,models:list})});
+      if(d&&d.error)throw new Error(d.error);
+      if(d&&d.exclusions)modelExclMap=d.exclusions;
       saved++;
     }
-    renderModelGroups();
-    toast(saved?"排除清单已保存":"无变更","ok","宿主热加载后数秒内生效；被禁模型仍显示在列表中，可随时恢复");
-  }catch(e){toast("保存失败","err",e.message)}
-  busy(btn,false);
+    // Re-read the catalog: the registered list may now show/hide models.
+    try{
+      const g=await api("/models/groups");
+      modelGroupsData=g;modelExclMap=(g&&g.excluded)||modelExclMap||{};
+      modelExclLoaded=!!(g&&g.excluded_ok);
+      renderModelGroups();
+      modelListData=g;renderModelList();
+    }catch(_){renderModelGroups()}
+    toast(saved?("排除清单已保存（"+saved+" 个渠道）"):"无变更","ok","已写入 config.yaml 的 oauth-excluded-models.qoder-<region>，宿主热加载后数秒内生效；被禁模型仍显示在列表中，可随时勾选恢复。");
+  }catch(e){toast("保存失败","err",e.message||String(e))}
+  finally{busy(btn,false)}
 }
 document.getElementById("keyInput").addEventListener("keydown",e=>{if(e.key==="Enter")saveKey()});
 document.addEventListener("keydown",e=>{

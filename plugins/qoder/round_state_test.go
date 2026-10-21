@@ -363,4 +363,15 @@ func TestCheckinHoursIncludeAfternoonCompensation(t *testing.T) {
 	if !has10 || !has15 || !has21 {
 		t.Fatalf("checkinHours = %v, want 10/15/21 (refresh + compensation + evening)", checkinHours)
 	}
+	// v0.8.65: the final same-day catch-up lets a 21:00 retry still fall back
+	// to 23:30 when the earlier ticks all came back empty.
+	has23 := false
+	for _, h := range checkinHours {
+		if h == 23 {
+			has23 = true
+		}
+	}
+	if !has23 {
+		t.Fatalf("checkinHours = %v, want a 23:00 catch-up tick", checkinHours)
+	}
 }

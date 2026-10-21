@@ -354,7 +354,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.8.63"
+var version = "0.8.75"
 
 // providerName is a VAR (split flavor, issue #29): the unified build keeps
 // the default "qoder"; the split-channel builds rename it via
@@ -379,7 +379,13 @@ func wbRegistration() registration {
 				{Name: "lifecycle_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Auto disable CN when credits exhausted; re-enable CN after check-in restores credits (default true)."},
 				{Name: "token_keepalive", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable daily access-token refresh at 22:00 local time to prevent Keycloak offline-session expiry (default true)."},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional model list. Each item can have id, name, alias, context, max_tokens, enabled, reasoning."},
-				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits}, Description: "Multi-account selection: off (defer to built-in, default) or credits (pick highest remaining). WARNING: when off + lifecycle_auto=false, exhausted accounts may still be routed — enable lifecycle_auto or set scheduler_mode=credits."},
+				{Name: "localize", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Publish friendly model ids derived from the display name (qfmodel → qwen3-8-flash, gmodel → glm-5-3) instead of Qoder's opaque keys (default true). Requests using the friendly id are mapped back to the real key."},
+				{Name: "model_ids", Type: pluginapi.ConfigFieldTypeObject, Description: "Custom client-facing ids: {raw_id: custom_id} (e.g. {qfmodel: my-flash}). Overrides the display-name slug; excluded/hidden lists may use either form. The host registers a catalog only at startup, so a new id is routable after CPA restarts — the panel can restart it automatically."},
+				{Name: "restart_on_model_ids", Type: pluginapi.ConfigFieldTypeBoolean, Description: "When a panel save changes model_ids, restart CPA so the host re-registers the catalog (default true; takes about 20-30 seconds). Set false to require a manual restart."},
+				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "Optional: the host's management key, used by the plugin to read/write oauth-excluded-models on the panel's behalf. Leave empty to use management.secret-key from the same config."},
+				{Name: "restart_script", Type: pluginapi.ConfigFieldTypeString, Description: "Launcher used for that restart (default: auto-detect start-pebrel.ps1 / start.bat next to cli-proxy-api.exe, else relaunch the binary with its original arguments)."},
+				{Name: "localize_keep_originals", Type: pluginapi.ConfigFieldTypeBoolean, Description: "With localize on, also keep the raw ids (qfmodel …) so existing clients keep working (default true; set false to publish only the friendly ids)."},
+				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits}, Description: "Multi-account selection: off (defer to built-in, default) or credits (pick the account with the most remaining credits; ties keep the current one; the panel selection follows the pick). WARNING: when off + lifecycle_auto=false, exhausted accounts may still be routed — enable lifecycle_auto or set scheduler_mode=credits."},
 				{Name: "usage_report_url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional override of CPAMP usage import URL (default http://cpa-manager-plus:18317/v0/management/usage/import; also env USAGE_REPORT_URL)."},
 				{Name: "usage_report_key", Type: pluginapi.ConfigFieldTypeString, Description: "Optional CPAMP admin key override. Prefer auto-detect from env CPAMP_ADMIN_KEY / USAGE_REPORT_KEY or secret file /run/secrets/cpamp_admin_key."},
 			},
@@ -758,7 +764,10 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	}
 	// Map CPA-facing model name (e.g. "qoder/qmodel_preview" or "qmodel_preview")
 	// to the upstream key the gateway recognises.
-	upstreamModel := cpaToUpstreamKey(stripProviderPrefix(req.Model))
+	// v0.8.69: a display-name slug (qwen3-8-flash) resolves back to the raw
+	// qoder key before the upstream-key mapping runs.
+	requestedModel := resolveLocalizedModel(stripProviderPrefix(req.Model))
+	upstreamModel := cpaToUpstreamKey(requestedModel)
 	cooldownModel := requestModelForCooldown(req.Model, req.Metadata)
 	started := time.Now()
 	authUID := ""
@@ -842,7 +851,8 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	upstreamModel := cpaToUpstreamKey(stripProviderPrefix(req.Model))
+	// v0.8.69: localized slug → raw qoder key (same mapping as execute).
+	upstreamModel := cpaToUpstreamKey(resolveLocalizedModel(stripProviderPrefix(req.Model)))
 	cooldownModel := requestModelForCooldown(req.Model, req.Metadata)
 	started := time.Now()
 	authUID := ""

@@ -47,6 +47,9 @@ type activeAuthCandidate struct {
 	ID        string
 	Disabled  bool
 	Exhausted bool
+	// Remain is the cached remaining credits; -1 (or any negative) = unknown.
+	// Only the credits-mode ranker reads it.
+	Remain int64
 }
 
 // pickActiveAuth chooses which qoderwork auth to use from host candidates.
@@ -93,6 +96,77 @@ func pickActiveAuth(candidates []activeAuthCandidate) string {
 		setActiveAuthID(next)
 	}
 	return next
+}
+
+// pickCreditsAuth chooses the account for scheduler_mode=credits. The current
+// selection stays as long as it holds a positive balance (sticky, so a session
+// stays on one account); otherwise the candidate with the most remaining
+// credits wins, draining the largest pool first before moving on. Unknown
+// balances rank below any candidate with a positive balance and above
+// exhausted ones; ties keep the current selection, then the host's candidate
+// order. Disabled candidates are never picked unless nothing else is left.
+func pickCreditsAuth(candidates []activeAuthCandidate) string {
+	if len(candidates) == 0 {
+		return ""
+	}
+	cur := getActiveAuthID()
+	// v0.8.65: sticky at the top. The panel selection holds traffic as long as
+	// it still has a positive balance — so credits mode never "bounces" between
+	// two accounts whose pools are close (which, under session affinity, would
+	// spread one conversation across accounts). Switch only when the current
+	// account is gone, disabled, exhausted or its balance is unknown/drained.
+	for _, c := range candidates {
+		if c.ID == cur && !c.Disabled && !c.Exhausted && c.Remain > 0 {
+			return cur
+		}
+	}
+	best := -1
+	for i, c := range candidates {
+		if c.Disabled {
+			continue
+		}
+		rankCur := creditsRank(c)
+		if best < 0 {
+			best = i
+			continue
+		}
+		b := candidates[best]
+		switch {
+		case rankCur > creditsRank(b):
+			best = i
+		case rankCur == creditsRank(b):
+			// Tie: keep the current selection, else the earlier candidate.
+			if c.ID == cur && b.ID != cur {
+				best = i
+			}
+		}
+	}
+	if best < 0 {
+		// Everything is disabled — keep the current selection if it is live.
+		for _, c := range candidates {
+			if c.ID == cur {
+				return cur
+			}
+		}
+		return candidates[0].ID
+	}
+	return candidates[best].ID
+}
+
+// creditsRank maps a candidate to a sortable rank: real remaining credits when
+// known, -1 for a never-fetched balance (unknown) and -2 for exhausted.
+// "Unknown" loses to any known positive pool but still beats a drained one —
+// except when the host itself says the account is exhausted (panel flag or an
+// empty 0/0 pool): that account is strictly worse than an unknown one, which
+// must not displace it.
+func creditsRank(c activeAuthCandidate) int64 {
+	if c.Exhausted {
+		return -2
+	}
+	if c.Remain < 0 {
+		return -1
+	}
+	return c.Remain
 }
 
 // ensureDefaultActiveAuth sets the panel-selected account.

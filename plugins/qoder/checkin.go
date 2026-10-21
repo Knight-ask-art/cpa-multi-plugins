@@ -17,6 +17,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,19 +48,25 @@ func ensureScheduler() {
 
 func nextCheckinTime(now time.Time) time.Time {
 	var earliest time.Time
-	// Consider both checkin and keepalive schedules so the timer wakes up for
-	// whichever fires first (e.g. 21:00 checkin vs 22:00 keepalive → 21:00 wins,
-	// then 22:00 keepalive fires on the next tick).
-	hours := append([]int{}, checkinHours...)
-	hours = append(hours, keepaliveHours...)
-	for _, h := range hours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+	consider := func(t time.Time) {
 		if !t.After(now) {
 			t = t.Add(24 * time.Hour) // slot already passed today → tomorrow
 		}
 		if earliest.IsZero() || t.Before(earliest) {
 			earliest = t
 		}
+	}
+	// Consider checkin, keepalive and the minute-offset compensation ticks so
+	// the timer wakes up for whichever fires first (e.g. 10:00 checkin vs
+	// 10:03 compensation → 10:00 wins; then 10:03 fires on the next tick).
+	for _, h := range checkinHours {
+		consider(time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location()))
+	}
+	for _, h := range keepaliveHours {
+		consider(time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location()))
+	}
+	for _, tk := range extraCheckinTicks {
+		consider(time.Date(now.Year(), now.Month(), now.Day(), tk.hour, tk.minute, 0, 0, now.Location()))
 	}
 	return earliest
 }
@@ -73,6 +81,15 @@ func schedulerLoop(stop chan struct{}) {
 			return
 		case <-timer.C:
 			runAutoCheckin()
+			// v0.8.68: accounts disabled for exhaustion come back once any
+			// tick finds credits again — check-in (any region), manual top-up
+			// or an upstream grant. This also heals the "disabled forever"
+			// gap: Intl used to never be re-enabled.
+			reenableFundedAccounts()
+			// v0.8.65: after every tick, look for rows that are closed now but
+			// open later today and schedule one targeted compensation pass
+			// (a row-timed wake-up, not a blind minute-offset retry).
+			scheduleCheckinRows()
 			// Fire keepalive if the current tick falls within its scheduled
 			// window (e.g. 22:00 keepalive fires on the 22:00 tick even though
 			// the previous checkin tick was 21:00).
@@ -146,6 +163,13 @@ func checkinWithWindowRetry(sa *storedAuth) (map[string]any, error) {
 		if !dailyWindowJustOpened(dailyWindowNow()) {
 			return res, nil
 		}
+		// v0.8.65: do not burn all three retries while the list says the row
+		// opens later today — one more look, then leave the rest to the
+		// row-timed compensation pass (scheduleCheckinRows).
+		rowOpensLater, _ := res["next_open_at"].(int64)
+		if rowOpensLater != 0 {
+			return res, nil
+		}
 		time.Sleep(windowRetryGap)
 		res, err = performCheckinCallFn(sa)
 	}
@@ -160,6 +184,7 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 	if doCheckin {
 		sa, err := hostAuthGet(f.AuthIndex)
 		if err != nil {
+			log.Printf("qoder: checkin ERROR %s get auth: %v", f.Name, err)
 			return
 		}
 		// CN: daily check-in when enabled.
@@ -169,10 +194,15 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 		// performCheckinCall owns the verdict now.
 		ci, err := fetchCheckinStatus(sa)
 		if err == nil && ci != nil && !ci.TodayCheckedIn {
-			if _, callErr := checkinWithWindowRetry(sa); callErr == nil {
+			if res, callErr := checkinWithWindowRetry(sa); callErr == nil {
 				// v0.8.8: 记录签到时刻（与手动签到一致），让紧随
 				// 其后的 reconcile 处于 lifecycle 宽限窗口内。
 				rememberCheckinMoment(f.ID)
+				// v0.8.65: one log line per account per tick — OK / SKIP[reason]
+				// / FAIL / ERROR, with the credit delta when the claim moved the
+				// pools. The scheduled path used to be completely silent, so
+				// "今早签到成功了吗" had no answer short of opening the panel.
+				log.Printf("%s", checkinLogLine(f.Name, autoCheckinVerdict(res)))
 				// Refresh once after a successful checkin call so cache reflects
 				// the post-call state. If the status call fails keep the pre-call
 				// snapshot rather than dropping it (v0.6.31: avoid shadowing ci
@@ -193,7 +223,15 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 						}
 					}
 				}
+			} else {
+				log.Printf("qoder: checkin ERROR %s claim: %v", f.Name, callErr)
 			}
+		} else if err != nil {
+			log.Printf("qoder: checkin ERROR %s status: %v", f.Name, err)
+		} else if ci == nil {
+			log.Printf("qoder: checkin SKIP[no_status] %s (status returned nothing)", f.Name)
+		} else {
+			log.Printf("qoder: checkin ALREADY %s msg=今日已签到", f.Name)
 		}
 		// Refresh cache with latest checkin status (merge, don't wipe credits/plan).
 		if ci != nil {
@@ -217,6 +255,125 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 	if lifecycleEnabled() {
 		_, _ = reconcileOneAccount(f.AuthIndex, f.ID, true)
 	}
+}
+
+// autoCheckinVerdict renders a scheduled claim response into the common panel
+// shape (success/skipped/reason/message) so the scheduled path logs the same
+// verdict vocabulary the manual path displays. The non-claim verdicts
+// (ALREADY_CLAIMED / NOTHING_CLAIMABLE / BLOCKED / NOT_ELIGIBLE) are NORMAL
+// states — SKIP, not FAIL — mirroring checkinOneAccount.
+func autoCheckinVerdict(res map[string]any) map[string]any {
+	out := map[string]any{}
+	if res == nil {
+		out["success"] = false
+		out["message"] = "empty claim response"
+		return out
+	}
+	if ok, _ := res["success"].(bool); ok {
+		out["success"] = true
+		if msg, ok := res["message"].(string); ok {
+			out["message"] = msg
+		}
+		return out
+	}
+	result, _ := res["result"].(string)
+	switch result {
+	case "ALREADY_CLAIMED":
+		out["success"] = true
+		out["skipped"] = true
+		out["reason"] = "already"
+		out["message"] = "今日已签到"
+	case "NOTHING_CLAIMABLE", "BLOCKED", "NOT_ELIGIBLE":
+		out["success"] = true
+		out["skipped"] = true
+		out["reason"] = strings.ToLower(result)
+		if msg, ok := res["message"].(string); ok && msg != "" {
+			out["message"] = msg
+		}
+		if fc, ok := res["failure_code"].(string); ok && fc != "" {
+			out["failure_code"] = fc
+		}
+	default:
+		out["success"] = false
+		out["message"] = summarizeCheckinClaimRes(res)
+	}
+	// Same "already" soft-fail reclass as the manual path.
+	if msg, _ := out["message"].(string); msg != "" && out["skipped"] != true {
+		low := strings.ToLower(msg)
+		if strings.Contains(low, "already") || strings.Contains(msg, "已签") || strings.Contains(msg, "今日") {
+			out["success"] = true
+			out["skipped"] = true
+			out["reason"] = "already"
+		}
+	}
+	return out
+}
+
+// checkinLogLine renders one check-in verdict as a single log line. The tags
+// stay in English so a grep over logs/main.log is trivial.
+func checkinLogLine(name string, out map[string]any) string {
+	var b strings.Builder
+	b.WriteString("qoder: checkin ")
+	switch {
+	case out["error"] != nil:
+		b.WriteString("ERROR ")
+		b.WriteString(name)
+		fmt.Fprintf(&b, " err=%v", out["error"])
+		return b.String()
+	case out["skipped"] == true:
+		b.WriteString("SKIP[")
+		b.WriteString(anyString(out["reason"], "?"))
+		b.WriteString("] ")
+	case out["success"] == true:
+		b.WriteString("OK ")
+	default:
+		b.WriteString("FAIL ")
+	}
+	b.WriteString(name)
+	if code := anyString(out["failure_code"], ""); code != "" {
+		b.WriteString(" code=")
+		b.WriteString(code)
+	}
+	if _, ok := out["credits_before"]; ok {
+		fmt.Fprintf(&b, " reward=%d credits %d→%d (%+d)",
+			anyInt(out["reward_credits"]), anyInt(out["credits_before"]),
+			anyInt(out["credits_after"]), anyInt(out["credits_delta"]))
+	} else if r := anyInt(out["reward_credits"]); r > 0 {
+		fmt.Fprintf(&b, " reward=%d", r)
+	}
+	if s := anyInt(out["streak_days"]); s > 0 && out["skipped"] == true {
+		fmt.Fprintf(&b, " streak=%d", s)
+	}
+	if msg := anyString(out["message"], ""); msg != "" {
+		b.WriteString(" msg=")
+		b.WriteString(msg)
+	}
+	return b.String()
+}
+
+// anyString reads a string field from a verdict map.
+func anyString(v any, def string) string {
+	if s, ok := v.(string); ok && s != "" {
+		return s
+	}
+	return def
+}
+
+// anyInt reads a numeric field from a verdict map (JSON numbers arrive as
+// float64; the manual path writes int64).
+func anyInt(v any) int64 {
+	switch t := v.(type) {
+	case int64:
+		return t
+	case int:
+		return int64(t)
+	case float64:
+		return int64(t)
+	case string:
+		n, _ := strconv.ParseInt(strings.TrimSpace(t), 10, 64)
+		return n
+	}
+	return 0
 }
 
 // handleManualCheckin checks in one account (auth_index) or all qoderwork
@@ -269,6 +426,9 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 	results := make([]map[string]any, len(targets))
 	for r := range outCh {
 		results[r.idx] = r.out
+		// v0.8.65: panel-triggered check-ins land in the log too, tagged
+		// "manual" so scheduled and on-demand runs stay distinguishable.
+		log.Printf("%s", strings.Replace(checkinLogLine(targets[r.idx].Name, r.out), "qoder: checkin ", "qoder: checkin(manual) ", 1))
 	}
 	successN, alreadyN, failN := 0, 0, 0
 	for _, r := range results {
