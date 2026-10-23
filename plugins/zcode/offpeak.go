@@ -248,12 +248,17 @@ func offPeakBizHint(bizCode int) string {
 // body and the {code:0,data} envelope are accepted (server v2 ships bare;
 // the zai gateway sometimes wraps).
 func offPeakRequest(method, path string, sa *storedAuth, body []byte) (json.RawMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), offPeakRequestTimeout)
+	defer cancel()
+	return offPeakRequestCtx(ctx, method, path, sa, body)
+}
+
+// offPeakRequestCtx is offPeakRequest with a caller-owned deadline.
+func offPeakRequestCtx(ctx context.Context, method, path string, sa *storedAuth, body []byte) (json.RawMessage, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = strings.NewReader(string(body))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), offPeakRequestTimeout)
-	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, offPeakBase+path, reader)
 	if err != nil {
 		return nil, err
@@ -323,7 +328,13 @@ func applyOffPeakTicketHeaders(req *http.Request, sa *storedAuth) {
 // as an error (the official client does the same so the UI can schedule a
 // re-probe instead of graying out forever).
 func offPeakQueryAvailability(sa *storedAuth) (*offPeakAvailability, error) {
-	raw, err := offPeakRequest(http.MethodGet, offPeakAvailabilityPath, sa, nil)
+	return offPeakQueryAvailabilityCtx(context.Background(), sa)
+}
+
+// offPeakQueryAvailabilityCtx is the availability GET with a caller-owned
+// deadline (the activity probe bounds its whole sweep).
+func offPeakQueryAvailabilityCtx(ctx context.Context, sa *storedAuth) (*offPeakAvailability, error) {
+	raw, err := offPeakRequestCtx(ctx, http.MethodGet, offPeakAvailabilityPath, sa, nil)
 	if err != nil {
 		return nil, err
 	}

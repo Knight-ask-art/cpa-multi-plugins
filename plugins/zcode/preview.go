@@ -158,6 +158,14 @@ type previewResponse struct {
 // requires login; preview with the account identity keeps the campaign
 // gateway's X-Device-Mid gate happy).
 func fetchClaimablePreview(sa *storedAuth) ([]previewPlan, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), previewTimeout)
+	defer cancel()
+	return fetchClaimablePreviewCtx(ctx, sa)
+}
+
+// fetchClaimablePreviewCtx is fetchClaimablePreview with a caller-owned
+// deadline, so the activity probe can bound the whole sweep.
+func fetchClaimablePreviewCtx(ctx context.Context, sa *storedAuth) ([]previewPlan, error) {
 	if sa == nil || strings.TrimSpace(sa.Auth.JWT) == "" {
 		return nil, fmt.Errorf("not logged in — no plan JWT (re-run login)")
 	}
@@ -166,8 +174,6 @@ func fetchClaimablePreview(sa *storedAuth) ([]previewPlan, error) {
 	q.Set("app_version", id.appVersion)
 	q.Set("platform", id.platformValue)
 	endpoint := zcodeAPIBase + "/zcode-plan/billing/preview?" + q.Encode()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -257,6 +263,7 @@ func handlePreviewList() map[string]any {
 		return map[string]any{"error": err.Error()}
 	}
 	results := make([]accountPreview, len(files))
+	probes := make([][]activityProbe, len(files))
 	var wg sync.WaitGroup
 	for i, f := range files {
 		wg.Add(1)
@@ -267,26 +274,47 @@ func handlePreviewList() map[string]any {
 			if err != nil {
 				res.Err = fmt.Errorf("load auth: %w", err)
 				results[i] = res
+				probes[i] = []activityProbe{{
+					Name: "账号", Status: probeStatusError, CheckedAt: time.Now().UTC().Format(time.RFC3339),
+					Error: "load auth: " + err.Error(),
+				}}
 				return
 			}
-			if sa == nil || strings.TrimSpace(sa.Auth.JWT) == "" {
-				res.Skipped = true
-				results[i] = res
-				return
-			}
-			plans, perr := fetchClaimablePreview(sa)
+			// v0.2.1: the unified sweep — banner feed, claimable plans,
+			// granted buckets, off-peak lane. preview's own result is taken
+			// from the sweep so each endpoint is queried exactly once.
+			var plans []previewPlan
+			probes[i], plans = probeActivityFeeds(firstNonEmpty(f.AuthIndex, f.ID), sa)
 			res.Plans = plans
-			res.Err = perr
+			if strings.TrimSpace(sa.Auth.JWT) == "" {
+				res.Skipped = true
+			} else {
+				// the sweep reports the preview error on its own row; lift it
+				// so the existing per-account error list keeps working.
+				for _, pr := range probes[i] {
+					if pr.Name == "可领取套餐 (billing/preview)" && pr.Status == probeStatusError {
+						res.Err = fmt.Errorf("%s", pr.Error)
+					}
+				}
+			}
 			results[i] = res
 		}(i, f)
 	}
 	wg.Wait()
 	plans, errs, checked := mergePreviewResults(results)
+	probeOut := make([]map[string]any, 0, len(probes))
+	for i, f := range files {
+		probeOut = append(probeOut, map[string]any{
+			"account": firstNonEmpty(f.Name, f.ID),
+			"probes":  probes[i],
+		})
+	}
 	return map[string]any{
 		"ok":               true,
 		"server_time":      time.Now().UTC().Format(time.RFC3339),
 		"accounts_checked": checked,
 		"plans":            plans,
 		"errors":           errs,
+		"probes":           probeOut,
 	}
 }

@@ -105,7 +105,7 @@ button.sec{background:var(--btn-sec);color:var(--fg)}button:disabled{opacity:.5;
     <div style="margin-top:10px"><button onclick="modelGroupsSave(this)">保存排除</button> <span class="sub">宿主热加载后数秒内生效</span></div>
   </div>
   <div class="card" id="claimOpsCard">
-    <h2>活动自动领取 <span class="badge">v0.2.0</span></h2>
+    <h2>活动自动领取 <span class="badge">v0.2.1</span></h2>
     <div class="sub">后台每 5 分钟检查可领取活动并自动领取（issue #23，移植上游 scheduler 语义）。活动挂验证码门时，用本页浏览器铸造的无感令牌（验证码池）自动过验；令牌耗尽会出现「需验证码」提示——点下面的按钮补几个即可恢复全自动。</div>
     <div id="claimOpsStatus"><div class="sub">加载中…</div></div>
     <div class="bar" style="margin-top:10px"><button onclick="mintPoolTokens(this)">验证码补给 ×3</button></div>
@@ -612,6 +612,39 @@ async function modelGroupsSave(btn){
   btn.disabled=false;
 }
 function fmtUnix(sec){try{return new Date(sec*1000).toLocaleString()}catch(e){return sec}}
+function probeTimeText(data){
+  const t=(data&&data.server_time)||'';
+  if(!t) return '未知';
+  try{ return new Date(t).toLocaleString(); }catch(e){ return t; }
+}
+function probeBadge(p){
+  const map={ok:['有','plan'],empty:['上游答：没有',''],route_absent:['无此接口',''],skipped:['未查询',''],error:['查询失败','exhausted']};
+  const b=map[p.status]||[p.status||'',''];
+  return '<span class="badge '+(b[1]||'')+'">'+escHtml(b[0])+'</span>';
+}
+function activityProbeHTML(list){
+  if(!list.length) return '';
+  let html='<div class="card"><h2>活动探测 <span class="badge">v0.2.1</span></h2>'
+    +'<div class="sub" style="margin:6px 0 10px">「没有活动」可能来自三处：上游确实没挂、账号不够资格、或者我们的查询根本没打通。下面逐条列出每个入口这次的实际结果（时间、HTTP、返回条数）。</div>';
+  list.forEach(function(acc){
+    html+='<div class="sub" style="margin:10px 0 4px"><b>'+escHtml(acc.account||'账号')+'</b></div>';
+    (acc.probes||[]).forEach(function(p){
+      const acts=(p.activities||[]).map(function(a){
+        const win=(a.starts_at||a.ends_at)?' <span class="sub">'+(a.starts_at?fmtUnix(a.starts_at):'')+(a.ends_at?' → '+fmtUnix(a.ends_at):'')+'</span>':'';
+        const link=a.link?(' <a href="'+escHtml(a.link)+'" target="_blank" rel="noopener">查看</a>'):'';
+        return '<div class="stat"><span class="k">活动</span><span class="v"><b>'+escHtml(a.title||'活动')+'</b>'
+          +(a.summary?'<div class="sub">'+escHtml(a.summary)+'</div>':'')+win+link+'</span></div>';
+      }).join('');
+      html+='<div class="stat"><span class="k">'+escHtml(p.name)+'</span><span class="v">'+probeBadge(p)
+        +(p.http_status?' <span class="sub">HTTP '+p.http_status+'</span>':'')
+        +(p.items?' <span class="sub">'+p.items+' 条</span>':'')
+        +((p.error||p.note)?'<div class="sub">'+escHtml(p.error||p.note)+'</div>':'')
+        +'<div class="sub" style="opacity:.6">'+escHtml(p.url||'')+'</div>'
+        +acts+'</span></div>';
+    });
+  });
+  return html+'</div>';
+}
 async function loadPreview(){
   const box=document.getElementById('claimBox');
   box.style.display='block';
@@ -619,8 +652,12 @@ async function loadPreview(){
   const data=await api('/preview');
   if(data.error){box.innerHTML='<div class="card err">'+escHtml(data.error)+'</div>';return}
   const plans=data.plans||[];
+  const probeHTML=activityProbeHTML(data.probes||[]);
   if(!plans.length){
-    box.innerHTML='<div class="card"><h2>当前没有可领取的活动</h2><div class="sub">活动由服务端按账号与时段下发；已领取过的活动不会再出现在列表里。</div></div>';
+    box.innerHTML='<div class="card"><h2>当前没有可领取的活动</h2><div class="sub">内联的「活动」通常挂在下面几处之一；这里把每一处都问过了，结论一起列出——'
+      +'上游答了「没有」和上游没答（报错/无此接口）是两回事，别混着看。久未变动时点右上「刷新」重问一次。</div>'
+      +'<div class="sub" style="margin-top:6px">查询时间：'+escHtml(probeTimeText(data))+'</div></div>'
+      +probeHTML;
     return;
   }
   let html='<div class="card"><h2>可领取活动（'+plans.length+'）</h2><div class="khint">点击「领取」弹出阿里云验证码：低风险环境无感通过（等于一键领取），否则拖动滑块完成人机验证，通过后插件立即向上游提交领取。领取账号为当前选中的路由账号；成功后余量区会出现对应额度池。</div></div><div class="grid">';
@@ -721,7 +758,14 @@ async function loadClaimOps(){
     const badge=accts.filter(a=>a.badge);
     let rows=accts.slice(0,4).map(a=>{
       const hold=a.hold_until?('<div class="sub">hold→'+escHtml(String(a.hold_until)).slice(0,80)+'</div>'):'';
-      return '<div class="stat"><span class="k">'+escHtml(a.auth_index||'')+'</span><span class="v">'+escHtml(a.kind||'-')+(a.message?' · '+escHtml(a.message):'')+'</span></div>'+hold;
+      // v0.2.1: 后台每次轮询的实际答案——0 条 = 上游说没有；有错误 = 上游没答。
+      let pv='';
+      if(a.preview_at){
+        pv='<div class="sub">上次预览：'+escHtml(new Date(a.preview_at).toLocaleString())
+          +' · 返回 '+(a.preview_items||0)+' 个可领套餐'
+          +(a.preview_error?(' · <span style="color:var(--err)">失败：'+escHtml(String(a.preview_error).slice(0,160))+'</span>'):'')+'</div>';
+      }
+      return '<div class="stat"><span class="k">'+escHtml(a.auth_index||'')+'</span><span class="v">'+escHtml(a.kind||'-')+(a.message?' · '+escHtml(a.message):'')+'</span></div>'+hold+pv;
     }).join('');
     document.getElementById('claimOpsStatus').innerHTML =
       '<div class="stat"><span class="k">自动领取</span><span class="v">'+(st.enabled?'开启':'关闭')+'</span></div>'

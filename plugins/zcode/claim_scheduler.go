@@ -86,6 +86,14 @@ type claimAccountState struct {
 	HoldUntil time.Time
 	Badge     bool
 	UpdatedAt time.Time
+
+	// v0.2.1: the scheduler is the only place that polls every panel
+	// interval, so it also records what the preview actually answered. A
+	// frozen "没有可领取的活动" panel can then be told apart from "上游说没有"
+	// (preview_items=0) and "上游根本没答" (preview_error).
+	PreviewAt    time.Time
+	PreviewItems int
+	PreviewErr   string
 }
 
 var claimSchedulerState struct {
@@ -189,12 +197,16 @@ func claimSchedulerTick(now time.Time) {
 			continue
 		}
 		plans, perr := fetchClaimablePreview(sa)
+		claimSchedulerState.Lock()
+		st.PreviewAt, st.PreviewItems = now, len(plans)
 		if perr != nil {
-			claimSchedulerState.Lock()
+			st.PreviewErr = perr.Error()
 			claimSchedulerState.lastError = "preview " + key + ": " + perr.Error()
 			claimSchedulerState.Unlock()
 			continue
 		}
+		st.PreviewErr = ""
+		claimSchedulerState.Unlock()
 		target := pickClaimTarget(plans, loadedClaimPlanID())
 		if target == nil {
 			claimSchedulerState.Lock()
@@ -253,6 +265,13 @@ func handleClaimStatus() map[string]any {
 		entry["badge"] = st.Badge
 		if !st.UpdatedAt.IsZero() {
 			entry["updated_at"] = st.UpdatedAt.UTC().Format(time.RFC3339)
+		}
+		if !st.PreviewAt.IsZero() {
+			entry["preview_at"] = st.PreviewAt.UTC().Format(time.RFC3339)
+		}
+		entry["preview_items"] = st.PreviewItems
+		if st.PreviewErr != "" {
+			entry["preview_error"] = st.PreviewErr
 		}
 		accounts = append(accounts, entry)
 		if st.Badge {
