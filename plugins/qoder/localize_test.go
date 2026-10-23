@@ -256,7 +256,7 @@ func TestModelGroupEntriesMarksHidden(t *testing.T) {
 	seedDisplay("qfmodel", "Qwen3.8-Flash")
 	seedDisplay("gmodel", "GLM-5.3")
 	setHiddenModels([]string{"gmodel"})
-	got := modelGroupEntries([]pluginapi.ModelInfo{
+	got := modelGroupEntries("cn", []pluginapi.ModelInfo{
 		{ID: "qfmodel", DisplayName: "Qwen3.8-Flash"},
 		{ID: "gmodel", DisplayName: "GLM-5.3"},
 	})

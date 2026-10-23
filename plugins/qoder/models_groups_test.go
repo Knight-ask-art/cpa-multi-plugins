@@ -220,7 +220,7 @@ func TestModelGroupEntriesDisplayNames(t *testing.T) {
 		{ID: "m-3", DisplayName: "m-3"}, // display name equal to id -> dropped (no duplicate label)
 		{ID: "", DisplayName: "ghost"},  // no id → skipped
 	}
-	rows := modelGroupEntries(models)
+	rows := modelGroupEntries("cn", models)
 	if len(rows) != 3 {
 		t.Fatalf("rows = %d, want 3 (empty id skipped)", len(rows))
 	}

@@ -507,6 +507,9 @@ func checkinOneAccount(f pluginapi.HostAuthFileEntry) map[string]any {
 	// old flow reported 签到成功 +100 with the post-claim balance only —
 	// when the claimed row was a coupon (redemptionCode, no credits) or
 	// the grant lagged, the user had no way to see WHY nothing moved.
+	// v0.8.76: the activity subtotal (ActivityRemain) is snapshotted too —
+	// a daily grant lands in an activity package, and that is the pool the
+	// delta must be read from when the subscription pools are untouched.
 	var creditsBefore *creditsSummary
 	if cr, err := fetchUserResource(sa); err == nil {
 		creditsBefore = cr
@@ -622,7 +625,19 @@ func checkinOneAccount(f pluginapi.HostAuthFileEntry) map[string]any {
 				out["credits_before"] = creditsBefore.TotalRemain
 				out["credits_after"] = cr.TotalRemain
 				out["credits_delta"] = delta
-				if delta <= 0 {
+				// v0.8.76: also report the activity-package delta. The daily
+				// grant is an activity package; when the total is unchanged
+				// but the activity subtotal moved, the grant DID land and the
+				// old single-delta message mislabelled it as "未变动".
+				actDelta := cr.ActivityRemain - creditsBefore.ActivityRemain
+				out["activity_before"] = creditsBefore.ActivityRemain
+				out["activity_after"] = cr.ActivityRemain
+				out["activity_delta"] = actDelta
+				if delta <= 0 && actDelta > 0 {
+					out["credited"] = true
+					msg, _ := out["message"].(string)
+					out["message"] = msg + "（活动积分 +" + strconv.FormatInt(actDelta, 10) + "）"
+				} else if delta <= 0 {
 					msg, _ := out["message"].(string)
 					if rc, _ := res["rewardCredits"].(float64); rc > 0 {
 						out["message"] = msg + "（上游已确认领取，但积分池暂未变动：发放可能有秒级延迟）"
@@ -1059,9 +1074,53 @@ func handleClaimPro(req pluginapi.ManagementRequest) map[string]any {
 	if _, ok := out["success"]; !ok {
 		out["success"] = true
 	}
-	// Refresh credits snapshot so panel shows updated balance immediately.
-	if cr, crErr := fetchUserResource(sa); crErr == nil && cr != nil {
-		out["credits"] = cr
+	// v0.8.76: snapshot before the claim (claimProViaCampaigns ran above, so
+	// this reads the post-claim state) and verify the grant landed. The claim
+	// endpoint answers ALREADY_CLAIMED / CLAIMED without saying whether the
+	// credits were ever delivered; L0NE-6/Qoder-Daily reads the pool back
+	// after claiming for exactly this reason (2026-10-20, "领取一次性 Pro
+	// 升级包 1800 积分").
+	hadCredits, _ := out["credits"].(*creditsSummary)
+	after, verified := verifyActivityGrant(sa, hadCredits)
+	if after != nil {
+		out["credits"] = after
+	}
+	if verified {
+		out["grant_verified"] = true
+	} else if success, _ := out["success"].(bool); success && hadCredits != nil {
+		out["grant_verified"] = false
+		out["message"] = strings.TrimSpace(asText(out["message"]) + "（领取已被上游确认，但活动积分池暂未看到增加，可能有分钟级延迟）")
 	}
 	return out
+}
+
+// verifyActivityGrant re-reads the quota pools after a claim and reports
+// whether the activity subtotal actually moved. Best-effort: a failed read
+// returns (nil, false) and never fails the claim.
+//
+// The upstream grant is not always immediate (the daily check-in needed a 3s
+// settle in v0.8.49), so this waits once before concluding "not yet".
+func verifyActivityGrant(sa *storedAuth, before *creditsSummary) (*creditsSummary, bool) {
+	time.Sleep(3 * time.Second)
+	cr, err := fetchUserResource(sa)
+	if err != nil || cr == nil {
+		return nil, false
+	}
+	if before == nil {
+		return cr, false
+	}
+	// Any movement in the activity subtotal counts: a fresh 1800 pack moves
+	// ActivityRemain up by 1800; a grant that landed before the first read
+	// still moves ActivitySize. Only "nothing changed" is unverified.
+	if cr.ActivityRemain != before.ActivityRemain || cr.ActivitySize != before.ActivitySize ||
+		cr.Packages == nil && before.Packages != nil {
+		return cr, true
+	}
+	return cr, false
+}
+
+// asText renders an already-stringified message field.
+func asText(v any) string {
+	s, _ := v.(string)
+	return s
 }

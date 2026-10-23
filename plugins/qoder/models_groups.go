@@ -71,6 +71,24 @@ type modelGroupEntry struct {
 	// (v0.8.71). Hidden entries stay in the panel list — unchecked and
 	// tagged — so the admin can always see and restore them.
 	Hidden bool `json:"hidden,omitempty"`
+	// Price carries the upstream credit multiplier when the model is in a
+	// price campaign (v0.8.76). Absent = upstream regular pricing, unknown.
+	Price *modelPrice `json:"price,omitempty"`
+	// HiddenBy / HiddenEntry name the hidden_models entries that hide this
+	// row and, when the entry is a stale spelling, say so (v0.8.77).
+	// Live field report: the model was renamed dfmodel → deepseek-v4.1-flash
+	// while hidden_models still carried "deepseek-flash"; the row showed
+	// "已隐藏" with no hint that an OLD name was doing it, and no server-side
+	// way to un-hide it. HiddenEntry is what the admin has to edit.
+	HiddenBy    []string `json:"hidden_by,omitempty"`
+	HiddenEntry []string `json:"hidden_entry,omitempty"`
+	// HiddenStale is true when no hidden entry matches this row's current
+	// facing id — i.e. the row is hidden by an id it no longer publishes.
+	HiddenStale bool `json:"hidden_stale,omitempty"`
+	// ExcludedBy names the oauth-excluded-models entries matching this row,
+	// with the same stale-spelling rule (v0.8.77).
+	ExcludedBy    []string `json:"excluded_by,omitempty"`
+	ExcludedStale bool     `json:"excluded_stale,omitempty"`
 }
 
 // modelGroup is one region's catalog as the panel picker consumes it.
@@ -97,6 +115,8 @@ type modelGroupsResponse struct {
 	// ExcludedOK is false when the host refused the read (bad key, banned IP).
 	// The panel then refuses to save instead of rewriting the lists blindly.
 	ExcludedOK bool `json:"excluded_ok"`
+	// HiddenModels is the plugin's hidden_models list verbatim (v0.8.77).
+	HiddenModels []string `json:"hidden_models,omitempty"`
 }
 
 // regionCatalogEntry is one credential's contribution to a region catalog scan.
@@ -148,11 +168,15 @@ func handleModelGroupsQuery(req pluginapi.ManagementRequest) (int, any) {
 	// The exclusion lists live in config.yaml; the plugin reads it through
 	// the host API on every call so the panel never acts on a stale copy.
 	excl, exclOK := fetchHostExcludedModelsChecked(bearerOf(req))
+	annotateExclusionCause(groups, excl)
 	return http.StatusOK, modelGroupsResponse{
 		Groups:     groups,
 		Hint:       "勾选=启用；取消勾选保存后该模型从渠道注册列表移除。与 CPA 全局页驱动同一份 oauth-excluded-models 配置。",
 		Excluded:   excl,
 		ExcludedOK: exclOK,
+		// HiddenModels echoes the operator's config list so the panel can point
+		// at the exact entry instead of a bare 已隐藏 (v0.8.77).
+		HiddenModels: hiddenEntriesSnapshot(),
 	}
 }
 
@@ -233,7 +257,7 @@ func buildModelGroup(region string, entries []*regionCatalogEntry, refresh bool)
 		if len(dyn) > 0 {
 			storeDynamicModels(modelCatalogAccountKey(sa), dyn)
 			persistModelSnapshot(pick.storage, region, dyn)
-			g.Models = modelGroupEntries(dyn)
+			g.Models = modelGroupEntries(region, dyn)
 			g.Count = len(g.Models)
 			g.Source = "refreshed"
 			g.FetchedAt = time.Now().UTC().Format(time.RFC3339)
@@ -255,7 +279,7 @@ func buildModelGroup(region string, entries []*regionCatalogEntry, refresh bool)
 		}
 	}
 	if best != nil && len(best.Models) > 0 {
-		g.Models = modelGroupEntries(best.Models)
+		g.Models = modelGroupEntries(region, best.Models)
 		g.Count = len(g.Models)
 		g.Source = "snapshot"
 		g.FetchedAt = best.FetchedAt
@@ -293,7 +317,7 @@ func pickRefreshCredential(entries []*regionCatalogEntry) *regionCatalogEntry {
 }
 
 // modelGroupEntries projects ModelInfos into picker rows (id + display name).
-func modelGroupEntries(models []pluginapi.ModelInfo) []modelGroupEntry {
+func modelGroupEntries(region string, models []pluginapi.ModelInfo) []modelGroupEntry {
 	noteCatalogDisplays(models)
 	hiddenSet := hiddenRawSet()
 	out := make([]modelGroupEntry, 0, len(models))
@@ -315,8 +339,74 @@ func modelGroupEntries(models []pluginapi.ModelInfo) []modelGroupEntry {
 		if !strings.EqualFold(facing, m.ID) {
 			upstream = m.ID
 		}
-		out = append(out, modelGroupEntry{ID: facing, Name: name, Facing: facing, Upstream: upstream,
-			Hidden: hiddenSet[strings.ToLower(m.ID)] || hiddenSet[strings.ToLower(facing)]})
+		entry := modelGroupEntry{ID: facing, Name: name, Facing: facing, Upstream: upstream,
+			Hidden: hiddenSet[strings.ToLower(m.ID)] || hiddenSet[strings.ToLower(facing)]}
+		entry.Price = priceFor(m.ID, facing, region)
+		entry.HiddenBy, entry.HiddenEntry = hiddenCause(m.ID, facing)
+		entry.HiddenStale = entry.Hidden && len(entry.HiddenBy) > 0 && !matchesFacing(entry.HiddenBy, facing)
+		out = append(out, entry)
 	}
 	return out
+}
+
+// hiddenEntriesSnapshot copies the configured hidden_models list.
+func hiddenEntriesSnapshot() []string {
+	// The operator's own spelling first (v0.8.78): the normalized list holds
+	// raw keys ("dfmodel"), which is not what their config.yaml says and not
+	// what they can copy back.
+	if cfg := hiddenConfigEntries(); len(cfg) > 0 {
+		return cfg
+	}
+	hiddenMu.RLock()
+	defer hiddenMu.RUnlock()
+	if len(hiddenModels) == 0 {
+		return nil
+	}
+	out := make([]string, len(hiddenModels))
+	copy(out, hiddenModels)
+	return out
+}
+
+// annotateExclusionCause fills ExcludedBy/ExcludedStale for every row, naming
+// the oauth-excluded-models entries that exclude it (v0.8.77). Entries are
+// matched after mapping back to raw keys, mirroring filterExcludedModels.
+func annotateExclusionCause(groups []modelGroup, excl map[string][]string) {
+	if len(excl) == 0 {
+		return
+	}
+	for gi := range groups {
+		region := strings.ToLower(strings.TrimSpace(groups[gi].Realm))
+		keys := []string{providerName}
+		if region != "" {
+			keys = append(keys, providerName+"-"+region)
+		}
+		var entries []string
+		for _, k := range keys {
+			entries = append(entries, excl[k]...)
+		}
+		if len(entries) == 0 {
+			continue
+		}
+		raws, _ := syncListToRawIds(entries)
+		for mi := range groups[gi].Models {
+			row := &groups[gi].Models[mi]
+			raw := row.Upstream
+			if raw == "" {
+				raw = row.ID
+			}
+			var by []string
+			for i, e := range entries {
+				r := strings.ToLower(strings.TrimSpace(raws[i]))
+				if r == strings.ToLower(raw) || strings.ToLower(e) == strings.ToLower(row.Facing) ||
+					strings.ToLower(r) == strings.ToLower(row.ID) {
+					by = append(by, e)
+				}
+			}
+			if len(by) == 0 {
+				continue
+			}
+			row.ExcludedBy = by
+			row.ExcludedStale = !matchesFacing(by, row.Facing)
+		}
+	}
 }

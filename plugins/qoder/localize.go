@@ -563,18 +563,90 @@ func parseModelIDTable(v any) map[string]string {
 // mapped back to raw keys before filtering.
 var (
 	hiddenMu      sync.RWMutex
-	hiddenModels  []string
+	hiddenModels  []string // normalized to raw keys (what filtering uses)
+	hiddenConfig  []string // exactly what config.yaml said (what the panel shows)
 	hiddenApplied = map[string]bool{}
 )
 
 func setHiddenModels(ids []string) {
 	out, _ := syncListToRawIds(ids)
+	cfg := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if v := strings.TrimSpace(id); v != "" {
+			cfg = append(cfg, v)
+		}
+	}
 	hiddenMu.Lock()
 	hiddenModels = out
+	hiddenConfig = cfg
 	hiddenMu.Unlock()
 	if len(out) > 0 {
 		log.Printf("qoder: hidden_models=%v (raw keys)", out)
 	}
+}
+
+// hiddenConfigEntries returns the list exactly as configured (v0.8.78).
+// The panel must show and offer to remove the spelling the operator wrote —
+// echoing the normalized raw key ("dfmodel") would hand them a config edit
+// that does not match their file.
+func hiddenConfigEntries() []string {
+	hiddenMu.RLock()
+	defer hiddenMu.RUnlock()
+	if len(hiddenConfig) == 0 {
+		return nil
+	}
+	out := make([]string, len(hiddenConfig))
+	copy(out, hiddenConfig)
+	return out
+}
+
+// removeHiddenModels drops entries from the LIVE list (v0.8.77).
+//
+// config.yaml is the source of truth and the plugin never rewrites it: the
+// host owns that file and a concurrent save would clobber whichever side
+// wrote last. So the panel's 取消隐藏 applies here, immediately, and hands the
+// operator the replacement YAML block to paste — otherwise the entry comes
+// back on the next restart. That became necessary when a model was renamed:
+// config still said "deepseek-flash", which after the rename resolved to no
+// published id at all, and the row showed 已隐藏 with no way to undo it.
+func removeHiddenModels(entries []string) (remaining, removed []string) {
+	drop := map[string]bool{}
+	for _, e := range entries {
+		if k := strings.ToLower(strings.TrimSpace(e)); k != "" {
+			drop[k] = true
+		}
+	}
+	cur := hiddenEntriesSnapshot()
+	remaining = make([]string, 0, len(cur))
+	for _, entry := range cur {
+		key := strings.ToLower(strings.TrimSpace(entry))
+		if drop[key] {
+			removed = append(removed, entry)
+			continue
+		}
+		remaining = append(remaining, entry)
+	}
+	if len(removed) == 0 {
+		return cur, nil
+	}
+	setHiddenModels(remaining)
+	log.Printf("qoder: hidden_models -= %v (live only; config.yaml still lists them)", removed)
+	return remaining, removed
+}
+
+// hiddenModelsYAMLBlock renders the replacement `hidden_models:` block for the
+// plugin's config section, ready to paste over the existing one.
+func hiddenModelsYAMLBlock(entries []string) string {
+	var b strings.Builder
+	b.WriteString("hidden_models:")
+	if len(entries) == 0 {
+		b.WriteString(" []")
+		return b.String()
+	}
+	for _, e := range entries {
+		b.WriteString(newlineChar + "    - \"" + strings.ReplaceAll(e, "\"", "\\\"") + "\"")
+	}
+	return b.String()
 }
 
 // hiddenRawSet returns the hidden raw keys, translating any client-facing ids
@@ -614,6 +686,55 @@ func hiddenToRaw(entry string) []string {
 	}
 	localizeMu.RUnlock()
 	return res
+}
+
+// hiddenCause reports which hidden_models entries hide a row and how each one
+// resolves to it (v0.8.77). Two shapes are returned:
+//
+//	cause — every hidden entry whose expansion covers this row's raw key
+//	        (the config spelling an admin sees, e.g. "deepseek-flash")
+//	via   — the spelling that actually matched (raw key or display slug)
+//
+// Both are empty when the row is not hidden. Entry-level (not set-level) so
+// the panel can point at the exact config line instead of just saying 已隐藏.
+func hiddenCause(raw, facing string) (cause, via []string) {
+	cur := hiddenConfigEntries()
+	if len(cur) == 0 {
+		cur = hiddenEntriesSnapshot()
+	}
+	if len(cur) == 0 {
+		return nil, nil
+	}
+	rawL, facingL := strings.ToLower(strings.TrimSpace(raw)), strings.ToLower(strings.TrimSpace(facing))
+	seen := map[string]bool{}
+	for _, entry := range cur {
+		e := strings.ToLower(strings.TrimSpace(entry))
+		if e == "" || seen[e] {
+			continue
+		}
+		for _, hit := range hiddenToRaw(entry) {
+			if hit == rawL || hit == facingL {
+				seen[e] = true
+				cause = append(cause, entry)
+				via = append(via, hit)
+				break
+			}
+		}
+	}
+	return cause, via
+}
+
+// matchesFacing reports whether any of ids is the row's current facing id —
+// false means the hiding/excluding entry names a spelling the model no longer
+// publishes (a stale rename in config).
+func matchesFacing(ids []string, facing string) bool {
+	f := strings.ToLower(strings.TrimSpace(facing))
+	for _, id := range ids {
+		if strings.ToLower(strings.TrimSpace(id)) == f {
+			return true
+		}
+	}
+	return false
 }
 
 // applyHiddenModels drops hidden raw keys from a catalog (identity-derived

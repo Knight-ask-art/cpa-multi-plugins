@@ -372,7 +372,28 @@ function progressHTML(c, disabled){
   const pct=total>0?Math.round(used/total*100):0;
   let color='var(--ok)'; if(pct>60)color='var(--warn)'; if(pct>85)color='var(--err)';
   const when=c.fetched_at?` · 快照 ${esc(String(c.fetched_at).replace('T',' ').replace('Z',' UTC'))}`:'';
-  return `<div class="pb"><div class="pb-label"><span>可用 ${remain}</span><span>已用 ${used} · ${pct}%</span></div><div class="pb-track"><div class="pb-bar" style="width:${pct}%;background:${color}"></div></div><div class="pb-meta">剩余 ${remain} · 已用 ${used} · 额度池 ${total}${c.pack_count?` · ${c.pack_count} 个包`:''}${when}</div></div>`;
+  // v0.8.76: activity/campaign grants (签到 100、Pro 包、SOTA 包) are money
+  // the account can spend but not part of the subscription allowance. Shown
+  // on their own line so "订阅额度用尽" no longer hides a few hundred grant
+  // credits sitting right next to it.
+  const actHTML=activityHTML(c);
+  return `<div class="pb"><div class="pb-label"><span>订阅可用 ${remain}</span><span>已用 ${used} · ${pct}%</span></div><div class="pb-track"><div class="pb-bar" style="width:${pct}%;background:${color}"></div></div><div class="pb-meta">剩余 ${remain} · 已用 ${used} · 额度池 ${total}${c.pack_count?` · ${c.pack_count} 个包`:''}${when}</div>${actHTML}</div>`;
+}
+/* activityHTML renders the activity-grant subtotal and its nearest expiry. */
+function activityHTML(c){
+  const remain=c.activity_remain||0, size=c.activity_size||0, packs=c.activity_packs||0;
+  if(!packs&&!size&&!remain)return "";
+  const used=c.activity_used||0;
+  let expiry="";
+  if(c.activity_expiring){
+    // Upstream stamps +08:00; render the short local form ("10-31 23:59 到期").
+    const m=/^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2})/.exec(String(c.activity_expiring));
+    expiry=m?` · ${m[2]}-${m[3]} ${m[4]} 到期`:"";
+    const soon=Date.parse(c.activity_expiring);
+    if(!isNaN(soon)&&soon-Date.now()<72*3600*1000) expiry=`<span style="color:var(--warn)">${expiry}</span>`;
+  }
+  const never=!c.activity_expiring&&packs>0;
+  return `<div class="pb-meta" style="margin-top:2px">活动积分 可用 ${remain}${size?` / ${size}`:''}${used?` · 已用 ${used}`:''} · ${packs} 个活动包${never?" · 无到期":""}${expiry}</div>`;
 }
 function bindCardActions(root){
   (root||document).querySelectorAll("[data-action]").forEach(btn=>{
@@ -754,7 +775,22 @@ function checkinResultToast(res, who){
   if(res.reason==="none"){toast(name+"：今日无可签领权益","warn",asText(res.message));return}
   if(res.reason==="not_eligible"){toast(name+"：暂不可领取","warn",asText(res.message));return}
   if(res.reason==="blocked"){toast(name+"：同人已领取","warn",asText(res.message));return}
-  if(res.success){toast(name+"：签到成功","ok","+"+(res.credit??res.daily_credit??res.reward_credits??"")+" 积分 · 连续 "+(res.streak_days??"?")+" 天");return}
+  if(res.success){
+    // v0.8.76: prefer the实测 delta. The claim's nominal rewardCredits can be
+    // non-zero while the pool never moved (coupon rows, lagging grants), and
+    // a grant that lands in an activity package only shows up in
+    // activity_delta — the old toast read the nominal number alone.
+    const act=typeof res.activity_delta==="number"?res.activity_delta:null;
+    const tot=typeof res.credits_delta==="number"?res.credits_delta:null;
+    const nominal=res.credit??res.daily_credit??res.reward_credits;
+    let detail;
+    if(act!==null&&act>0) detail="活动积分 +"+act+(res.activity_after!=null?"（活动可用 "+res.activity_after+"）":"");
+    else if(tot!==null&&tot>0) detail="+"+tot+" 积分";
+    else detail="+"+(nominal??"")+" 积分";
+    if(res.grant_verified===false) detail+=" · 积分池暂未核对到增量";
+    detail+=" · 连续 "+(res.streak_days??"?")+" 天";
+    toast(name+"：签到成功","ok",detail);return;
+  }
   toast(name+"："+(asText(res.message)||"未知结果"),"warn");
 }
 function isCheckinDoneResult(res){
@@ -815,7 +851,14 @@ async function claimPro(idx, btn){
     const d=await api("/claim-pro",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({auth_index:idx})});
     const name=d.nickname||"账号";
     if(d.error){toast(name+"：领取失败","err",asText(d.error));busy(btn,false);return}
-    if(d.success){toast(name+"：领取成功","ok",(asText(d.message)||"Pro 升级包已领取")+(d.credits?(" · 积分 "+(d.credits.total_remain||0)):""))}
+    if(d.success){
+      // v0.8.76: the claim is verified by reading the pools back, so say what
+      // was actually measured instead of echoing the nominal +1800.
+      let extra="";
+      if(d.credits) extra=" · 可用 "+(d.credits.total_remain||0)+(d.credits.activity_remain?("（活动 "+(d.credits.activity_remain)+"）"):"");
+      if(d.grant_verified===false) extra+=" · 积分池暂未核对到增量";
+      toast(name+"：领取成功","ok",(asText(d.message)||"Pro 升级包已领取")+extra);
+    }
     else{toast(name+"："+(asText(d.message)||"不可领取"),"warn")}
     await new Promise(r=>setTimeout(r,1500)); await load(true);
   }catch(e){
@@ -1016,15 +1059,24 @@ function renderModelList(){
       const typed=pendingModelIDs[g.realm+"|"+id];
       const cur=(typed!==undefined)?typed:id;
       const changed=(typed!==undefined&&typed!==id);
+      // v0.8.77: name the config entry that hides/excludes the row, and flag
+      // entries written against a spelling the model no longer uses. That was
+      // the dfmodel → deepseek-v4.1-flash trap: hidden_models still said
+      // "deepseek-flash", the row read 已隐藏 with no way to see why.
+      const why=[];
+      if(hidden&&m.hidden_by&&m.hidden_by.length) why.push("hidden_models: "+m.hidden_by.map(x=>'"'+x+'"').join("、")+(m.hidden_stale?"（旧名，与当前对外 ID 不一致）":""));
+      if(excluded&&m.excluded_by&&m.excluded_by.length) why.push("排除清单: "+m.excluded_by.map(x=>'"'+x+'"').join("、")+(m.excluded_stale?"（旧名）":""));
       const badge=locked?'<span class="badge disabled">全局禁用</span>'
         :(excluded?'<span class="badge disabled">已禁用</span>'
         :(hidden?'<span class="badge disabled">已隐藏</span>':'<span class="badge">启用中</span>'));
+      const unhide=(hidden&&m.hidden_by&&m.hidden_by.length)
+        ?'<button class="sec" style="padding:1px 8px;font-size:11px" data-unhide="'+esc(m.hidden_by.join("|"))+'" data-realm="'+esc(g.realm)+'" title="从 hidden_models 里移除这些条目并保存">取消隐藏</button>':'';
       return '<div class="ml-row'+(changed?" ml-changed":"")+'">'
         +'<span>'+(excluded||hidden||locked?"○":"●")+'</span>'
-        +'<span>'+esc(m.name||id)+'</span>'
+        +'<span>'+esc(m.name||id)+(why.length?'<div class="ml-raw" style="margin-top:2px">'+esc(why.join(" · "))+'</div>':'')+'</span>'
         +'<input type="text" value="'+esc(cur)+'" data-mlid="'+esc(g.realm)+'" data-mgid="'+esc(id)+'" data-mgraw="'+esc(raw)+'" placeholder="对外 ID" title="客户端看到的模型 id；改完点「保存对外 ID」">'
         +'<span class="ml-raw">'+(up?"上游 "+esc(up):(hidden?"hidden_models":""))+'</span>'
-        +'<span>'+badge+'</span></div>';
+        +'<span style="display:flex;gap:6px;align-items:center">'+badge+unhide+'</span></div>';
     }).join("");
     return '<div class="mg-group"><div class="mg-hd"><b>'+esc(g.label)+'</b><span class="mg-meta">'+(g.count||0)+' 个模型'+(g.note?" · "+esc(g.note):"")+'</span></div>'
       +'<div class="ml-hd"><span></span><span>模型</span><span>对外 ID</span><span>来源</span><span>状态</span></div>'+rows+'</div>';
@@ -1036,6 +1088,37 @@ function renderModelList(){
       const row=inp.closest(".ml-row");if(row)row.classList.toggle("ml-changed",inp.value.trim()!==raw);
     });
   });
+  box.querySelectorAll("[data-unhide]").forEach(function(btn){
+    if(btn._bound)return;
+    btn._bound=true;
+    btn.addEventListener("click",function(){unhideEntries(btn.getAttribute("data-unhide").split("|"),btn);});
+  });
+}
+/* unhideEntries (v0.8.77): drop entries from the PLUGIN's hidden_models.
+   The list lives in config.yaml, which the plugin cannot rewrite — it hands
+   the operator an exact replacement block and applies the change to the live
+   process so the catalog updates without a restart. */
+async function unhideEntries(entries,btn){
+  entries=entries.filter(Boolean);
+  if(!entries.length)return;
+  const lines=entries.map(function(e){return '  - "'+e+'"';}).join(NL);
+  if(!window.confirm("从 hidden_models 移除："+NL+NL+lines+NL+NL+"确认后插件立即按新列表发布模型；config.yaml 需要你同步改一下（会给出可直接替换的片段）。")) return;
+  busy(btn,true);
+  try{
+    const d=await api("/hidden-models",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:entries})});
+    if(d&&d.error)throw new Error(d.error);
+    const yaml=d&&d.config_yaml ? String(d.config_yaml) : "";
+    await modelListLoad(false);
+    try{ await modelCtlLoad?.(); }catch(_){}
+    if(yaml){
+      // Copy-friendly: show the block, and put it on the clipboard when allowed.
+      let copied=false;
+      try{ await navigator.clipboard.writeText(yaml); copied=true; }catch(_){}
+      window.prompt(copied?"已复制 hidden_models 新配置（替换 config.yaml 里的同名块）：":"hidden_models 新配置（替换 config.yaml 里的同名块）：",yaml);
+    }
+    toast("已取消隐藏","ok",entries.join("、")+(d&&d.needs_config_edit?" · 记得同步 config.yaml，否则重启后又会隐藏":""));
+  }catch(e){toast("取消失败","err",e.message||String(e))}
+  busy(btn,false);
 }
 /* ===== 保存后自动重启 CPA（v0.8.73）=====
    宿主只在插件注册时读取模型目录，所以改过的对外 ID 必须重启 CPA 才能被路由。
@@ -1054,6 +1137,7 @@ function autoRestartOn(){
   el.addEventListener("change",function(){try{localStorage.setItem(AUTORESTART_KEY,el.checked?"1":"0")}catch(_){}});
 })();
 function qdSleep(ms){return new Promise(function(r){setTimeout(r,ms)})}
+const NL=String.fromCharCode(10);
 function restartBanner(txt){
   const el=document.getElementById("restartBanner");
   if(!el)return;
@@ -1134,6 +1218,21 @@ function globalExclSet(){
   const m=modelExclMap||{};
   return new Set((m["qoder"]||[]).map(x=>String(x).toLowerCase()));
 }
+/* priceBadgeHTML (v0.8.76): a time-boxed price campaign is shown only while
+   it is active, and the label carries the end date — dsh-our-free-model #518
+   showed why "免费" without an end date turns into a permanent lie once the
+   campaign closes and the compiled table cannot see the upstream tag. */
+function priceBadgeHTML(p){
+  if(!p||!p.promo_active)return "";
+  const until=p.free_until?String(p.free_until).slice(0,10):"";
+  if(p.limited_free){
+    return `<span class="badge" style="color:var(--ok);border-color:var(--ok)" title="${esc("上游限时免费"+(until?"，至 "+until:""))}">限时免费${until?" · 至 "+esc(until.slice(5)):""}</span>`;
+  }
+  if(p.price_factor!==undefined&&p.price_factor!==null){
+    return `<span class="badge" title="${esc("上游倍率 x"+p.price_factor)}">x${esc(String(p.price_factor))}</span>`;
+  }
+  return "";
+}
 function renderModelGroups(){
   const box=document.getElementById("modelGroupsBox");
   const groups=(modelGroupsData&&modelGroupsData.groups)||[];
@@ -1153,9 +1252,10 @@ function renderModelGroups(){
       const facing=(m.facing||id).toLowerCase();
       const checked=!locked&&!hidden&&!excl.has(id.toLowerCase())&&!excl.has(facing);
       const label=m.name?`${esc(m.name)} <span style="color:var(--mut);font-size:11px">${esc(id)}</span>`:esc(id);
+      const priceBadge=priceBadgeHTML(m.price);
       const tip=locked?"已被 qoder 全局键禁用（CPA 全局页管理），此处锁定":(hidden?"已被插件 hidden_models 隐藏（config.yaml）；勾选后保存即可恢复":"勾选=启用，取消勾选=禁用");
       return `<label class="mg-item${locked?" mg-locked":""}" title="${tip}">
-        <input type="checkbox" data-mg="${esc(g.realm)}" value="${esc(id)}" data-facing="${esc(m.facing||id)}"${hidden?' data-hidden="1"':""}${checked?" checked":""}${locked?" disabled":""}>${label}${locked?' <span class="badge disabled">全局禁用</span>':""}${hidden?' <span class="badge disabled">已隐藏</span>':""}</label>`;
+        <input type="checkbox" data-mg="${esc(g.realm)}" value="${esc(id)}" data-facing="${esc(m.facing||id)}"${hidden?' data-hidden="1"':""}${checked?" checked":""}${locked?" disabled":""}>${label}${locked?' <span class="badge disabled">全局禁用</span>':""}${hidden?' <span class="badge disabled">已隐藏</span>':""}${priceBadge}</label>`;
     }).join("");
     const meta=[];
     if(g.source==="refreshed")meta.push(`实时目录 ${g.count} 个`);

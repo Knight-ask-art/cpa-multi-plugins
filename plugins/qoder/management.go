@@ -41,7 +41,29 @@ type creditsSummary struct {
 	// timestamp — not only the numbers — when diagnosing frozen credits.
 	FetchedAt string           `json:"fetched_at,omitempty"`
 	Packages  []packageSummary `json:"packages"`
+	// Activity* (v0.8.76) are the activity/campaign grants (daily check-in
+	// 100, Pro upgrade pack, SOTA packages) held apart from the subscription
+	// pools. They are NOT subtracted from Total*, which keep summing every
+	// package — a consumer that treats Total as the subscription allowance
+	// would otherwise flip the account to "exhausted" seconds after chat
+	// spends the day's grant.
+	ActivityRemain int64 `json:"activity_remain"`
+	ActivityUsed   int64 `json:"activity_used"`
+	ActivitySize   int64 `json:"activity_size"`
+	ActivityPacks  int   `json:"activity_packs"`
+	// ActivityExpiring is the smallest future expiry among activity packages
+	// (RFC3339, +08:00). Empty when nothing is expiring.
+	ActivityExpiring string `json:"activity_expiring,omitempty"`
 }
+
+// Package kinds — the panel groups rows by these and the quota view keeps
+// activity grants out of the subscription numbers.
+const (
+	packageKindBase     = "base"
+	packageKindAddOn    = "addon"
+	packageKindActivity = "activity"
+	packageKindOrg      = "org"
+)
 
 type packageSummary struct {
 	Name       string `json:"name"`
@@ -50,6 +72,96 @@ type packageSummary struct {
 	Size       int64  `json:"size"`
 	CycleStart string `json:"cycle_start"`
 	CycleEnd   string `json:"cycle_end"`
+	// Kind is the row's provenance (v0.8.76).
+	Kind string `json:"kind,omitempty"`
+	// Activity marks a row that belongs to the activity-grant subtotal
+	// (redundant with Kind=="activity" but cheap for the panel).
+	Activity bool `json:"activity,omitempty"`
+	// ExpiresAt is the grant's expiry (RFC3339) or empty when none was
+	// reported. Upstream's 9999 sentinel is normalised to empty.
+	ExpiresAt string `json:"expires_at,omitempty"`
+	// NeverExpires is set when upstream reported the no-expiry sentinel.
+	NeverExpires bool `json:"never_expires,omitempty"`
+	// Expired marks a grant whose expiry has already passed.
+	Expired bool `json:"expired,omitempty"`
+}
+
+// modelPrice is the upstream credit multiplier for one model (v0.8.76).
+// Qoder runs time-boxed promotions — CN DeepSeek-Flash (dfmodel) has been at
+// priceFactor 0 since 2026-10-17 — and the multiplier is the only way a
+// client can tell "free for now" from "always cheap". Upstream decomposes a
+// limited-time free row into priceFactor / originalPriceFactor / a
+// Limited-Time-Free tag; the compiled fallback table cannot read tags, so the
+// promo end is carried as FreeUntil and the row falls back to the original
+// multiplier by itself once it passes (dsh-our-free-model #518).
+type modelPrice struct {
+	PriceFactor         float64 `json:"price_factor"`
+	OriginalPriceFactor float64 `json:"original_price_factor,omitempty"`
+	// FreeUntil is the promo end (RFC3339, +08:00) for a 0x row; empty when
+	// the row is not a promotion.
+	FreeUntil string `json:"free_until,omitempty"`
+	// PromoActive is evaluated server-side so every client agrees.
+	PromoActive bool `json:"promo_active"`
+	// LimitedFree marks a currently-free promotion row.
+	LimitedFree bool `json:"limited_free,omitempty"`
+	// Regions lists the realms the campaign was observed in ("cn", "intl").
+	// A price campaign is an upstream fact per realm: dsh-our-free-model #518
+	// documented the CN 0x run, and carrying it onto Intl would advertise a
+	// discount that realm never published. Empty = realm unknown, shown
+	// everywhere.
+	Regions []string `json:"regions,omitempty"`
+}
+
+// priceFor returns the price campaign for a catalog row in one realm,
+// matching either the raw upstream key or the published facing id. nil = no
+// campaign, i.e. upstream regular pricing.
+func priceFor(raw, facing, region string) *modelPrice {
+	table := pricePromotions(time.Now())
+	for _, key := range []string{raw, facing} {
+		p, ok := table[strings.ToLower(strings.TrimSpace(key))]
+		if !ok {
+			continue
+		}
+		if len(p.Regions) > 0 {
+			match := false
+			for _, r := range p.Regions {
+				if r == strings.ToLower(strings.TrimSpace(region)) {
+					match = true
+					break
+				}
+			}
+			if !match {
+				return nil
+			}
+		}
+		cp := p
+		return &cp
+	}
+	return nil
+}
+
+// pricePromotions is the compiled fallback table for time-boxed price
+// campaigns. Unknown models report no price at all rather than a guessed one.
+func pricePromotions(now time.Time) map[string]modelPrice {
+	out := map[string]modelPrice{}
+	// CN DeepSeek-Flash 0x activity: regular multiplier 0.1, free from
+	// 2026-10-17 until 2026-10-25 00:00 +08:00.
+	if until, err := time.Parse(time.RFC3339, "2026-10-25T00:00:00+08:00"); err == nil {
+		active := now.Before(until)
+		pf := 0.0
+		if !active {
+			pf = 0.1
+		}
+		out["dfmodel"] = modelPrice{
+			PriceFactor:         pf,
+			OriginalPriceFactor: 0.1,
+			FreeUntil:           until.Format(time.RFC3339),
+			PromoActive:         active,
+			LimitedFree:         active,
+			Regions:             []string{regionCN},
+		}
+	}
+	return out
 }
 
 type checkinSummary struct {
@@ -135,6 +247,7 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodGet, Path: base + "/exclusions", Description: "v0.8.74: the host's oauth-excluded-models entries for qoder / qoder-cn / qoder-intl, read by the plugin with the host's own secret-key."},
 			{Method: http.MethodPost, Path: base + "/exclusions", Description: "v0.8.74: set one key of that table ({provider, models}); an empty list removes the key."},
 			{Method: http.MethodPost, Path: base + "/exclusions/reset?realm=cn|intl", Description: "v0.8.74: remove one region's exclusion key entirely."},
+			{Method: http.MethodPost, Path: base + "/hidden-models", Description: "v0.8.77: drop entries from hidden_models in the LIVE process ({remove:[...]}) and return the replacement config.yaml block. config.yaml itself is never rewritten — the operator pastes the returned block so a restart keeps the change."},
 		},
 		Resources: []resourceRoute{
 			{Path: "/panel", Menu: "Qoder", Description: "Qoder dashboard (CN + Intl): credits, check-in, plan, import."},
@@ -209,6 +322,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(mgmtJSONResponse(status, payload))
 	case req.Method == http.MethodPost && path == base+"/model-ids":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleModelIDs(req)))
+	case req.Method == http.MethodPost && path == base+"/hidden-models":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleHiddenModels(req)))
 	case req.Method == http.MethodGet && path == base+"/status":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, pluginStatus()))
 	case req.Method == http.MethodGet && path == base+"/exclusions",
@@ -346,6 +461,7 @@ func mutatingManagementPath(path string) bool {
 		base + "/keepalive",
 		base + "/claim-pro",
 		base + "/model-ids",
+		base + "/hidden-models",
 		base + "/exclusions":
 		return true
 	}

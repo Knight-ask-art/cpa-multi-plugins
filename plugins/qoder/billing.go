@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -199,12 +200,27 @@ type quotaUsageResponse struct {
 
 // quotaPool is one resource pool in the quota/usage response. Field names
 // mirror userQuota's shape (verified against the fork's parsed struct).
+// The expiry fields are optional: upstream reports activity grants with one of
+// several spellings (ms epoch, s epoch, ISO string) and uses the 9999
+// sentinel for "no expiry".
 type quotaPool struct {
-	Name      string  `json:"name"`
-	Total     float64 `json:"total"`
-	Used      float64 `json:"used"`
-	Remaining float64 `json:"remaining"`
+	Name            string  `json:"name"`
+	Total           float64 `json:"total"`
+	Used            float64 `json:"used"`
+	Remaining       float64 `json:"remaining"`
+	ExpiresAt       any     `json:"expiresAt"`
+	ExpireAt        any     `json:"expireAt"`
+	EndTime         any     `json:"endTime"`
+	ExpireTime      any     `json:"expireTime"`
+	ExpirationTime  any     `json:"expirationTime"`
+	NeverExpires    bool    `json:"neverExpires"`
+	UnlimitedExpire bool    `json:"unlimitedExpire"`
 }
+
+// noExpirySentinel is upstream's "never expires" marker (dsh-qoder-connect
+// #16 documented the same 9999 sentinel on the Intl SOTA package). Any
+// seconds/ms value at or above it is treated as "no expiry".
+const noExpirySentinel = int64(9999)
 
 // fetchUserResource queries QoderWork's quota endpoint and aggregates base +
 // add-on credits into the panel's creditsSummary shape.
@@ -248,11 +264,11 @@ func summarizeQuotaResponse(q quotaUsageResponse) *creditsSummary {
 		TotalSize:   int64(q.UserQuota.Total + q.AddOnQuota.Total),
 		PackCount:   2,
 		Packages: []packageSummary{
-			{Name: "基础额度", Remain: int64(q.UserQuota.Remaining), Used: int64(q.UserQuota.Used), Size: int64(q.UserQuota.Total)},
-			{Name: "赠送/签到额度", Remain: int64(q.AddOnQuota.Remaining), Used: int64(q.AddOnQuota.Used), Size: int64(q.AddOnQuota.Total)},
+			{Name: "基础额度", Kind: packageKindBase, Remain: int64(q.UserQuota.Remaining), Used: int64(q.UserQuota.Used), Size: int64(q.UserQuota.Total)},
+			{Name: "赠送/签到额度", Kind: packageKindAddOn, Remain: int64(q.AddOnQuota.Remaining), Used: int64(q.AddOnQuota.Used), Size: int64(q.AddOnQuota.Total)},
 		},
 	}
-	appendPool := func(pool quotaPool, fallbackName string) {
+	appendPool := func(pool quotaPool, fallbackName, kind string) {
 		sum.TotalRemain += int64(pool.Remaining)
 		sum.TotalUsed += int64(pool.Used)
 		sum.TotalSize += int64(pool.Total)
@@ -260,16 +276,124 @@ func summarizeQuotaResponse(q quotaUsageResponse) *creditsSummary {
 		if name == "" {
 			name = fallbackName
 		}
-		sum.Packages = append(sum.Packages, packageSummary{Name: name, Remain: int64(pool.Remaining), Used: int64(pool.Used), Size: int64(pool.Total)})
+		row := packageSummary{Name: name, Kind: kind, Remain: int64(pool.Remaining), Used: int64(pool.Used), Size: int64(pool.Total)}
+		row.ExpiresAt, row.NeverExpires, row.Expired = poolExpiry(pool, time.Now())
+		if kind == packageKindActivity {
+			row.Activity = true
+			sum.ActivityRemain += row.Remain
+			sum.ActivityUsed += row.Used
+			sum.ActivitySize += row.Size
+			sum.ActivityPacks++
+			// The soonest future expiry drives the panel's "活动积分 X 月底到期"
+			// hint; an expired row never becomes the headline.
+			if row.ExpiresAt != "" && !row.Expired &&
+				(sum.ActivityExpiring == "" || row.ExpiresAt < sum.ActivityExpiring) {
+				sum.ActivityExpiring = row.ExpiresAt
+			}
+		}
+		sum.Packages = append(sum.Packages, row)
 		sum.PackCount++
 	}
 	for i, pool := range q.DedicatedResourcePackages {
-		appendPool(pool, fmt.Sprintf("专用资源包 %d", i+1))
+		appendPool(pool, fmt.Sprintf("专用资源包 %d", i+1), packageKindActivity)
 	}
 	if q.OrgResourcePackage != nil {
-		appendPool(*q.OrgResourcePackage, "组织共享池")
+		appendPool(*q.OrgResourcePackage, "组织共享池", packageKindOrg)
 	}
 	return sum
+}
+
+// poolExpiry resolves a pool's expiry into (RFC3339, neverExpires, expired).
+// Upstream is inconsistent: ms epoch, s epoch, ISO strings and the 9999
+// sentinel all appear across regions and client versions, and a missing
+// field must stay missing (empty string) rather than be invented.
+func poolExpiry(pool quotaPool, now time.Time) (string, bool, bool) {
+	if pool.NeverExpires || pool.UnlimitedExpire {
+		return "", true, false
+	}
+	raw, ok := firstNonNil(pool.ExpiresAt, pool.ExpireAt, pool.EndTime, pool.ExpireTime, pool.ExpirationTime)
+	if !ok {
+		return "", false, false
+	}
+	t, never, ok := parsePoolExpiry(raw)
+	if !ok {
+		// "Present but not an instant" (a bare day counter) is not the same
+		// as "field absent"; report unknown rather than invent an expiry.
+		return "", false, false
+	}
+	if never {
+		return "", true, false
+	}
+	return t.Format("2006-01-02T15:04:05+08:00"), false, !t.After(now)
+}
+
+func firstNonNil(vals ...any) (any, bool) {
+	for _, v := range vals {
+		if v != nil {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+// parsePoolExpiry accepts the encodings upstream uses and reports the
+// no-expiry sentinel separately so the caller can label it honestly.
+func parsePoolExpiry(raw any) (time.Time, bool, bool) {
+	china := time.FixedZone("UTC+8", 8*3600)
+	switch v := raw.(type) {
+	case float64:
+		return epochToTime(int64(v), china)
+	case int64:
+		return epochToTime(v, china)
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return time.Time{}, false, false
+		}
+		return epochToTime(n, china)
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return time.Time{}, false, false
+		}
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return epochToTime(n, china)
+		}
+		for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"} {
+			if t, err := time.Parse(layout, s); err == nil {
+				return t.In(china), false, true
+			}
+		}
+	}
+	return time.Time{}, false, false
+}
+
+// epochToTime classifies an epoch as seconds or milliseconds (anything past
+// 1e11 is milliseconds). The small-value band (9999, 9999-12-31 in seconds)
+// is the "never expires" sentinel family, NOT a real instant — treating it
+// as one would render "1970-01-01" for a pack that never expires.
+func epochToTime(n int64, loc *time.Location) (time.Time, bool, bool) {
+	if n <= 0 {
+		return time.Time{}, false, false
+	}
+	if n == noExpirySentinel || n == 9999999999 || n == 9999999999999 {
+		return time.Time{}, true, true
+	}
+	const sentinelFloor = int64(253402300799) // 9999-12-31 23:59:59 UTC, seconds
+	if n < 100000 {
+		// A bare day counter (e.g. 30) is a duration, not an instant.
+		return time.Time{}, false, false
+	}
+	if n < 100000000000 { // < 1e11 → seconds
+		if n >= sentinelFloor {
+			return time.Time{}, true, true
+		}
+		return time.Unix(n, 0).In(loc), false, true
+	}
+	if n > sentinelFloor*1000 {
+		return time.Time{}, true, true
+	}
+	return time.UnixMilli(n).In(loc), false, true
 }
 
 // planResponse mirrors GET /api/v2/user/plan (plain JSON, no envelope).
