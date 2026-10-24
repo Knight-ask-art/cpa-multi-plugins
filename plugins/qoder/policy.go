@@ -209,8 +209,12 @@ func upstreamStatusError(status int, err error) error {
 		// "skip this credential"), while errorEnvelopeFor reports 429 +
 		// Retry-After to the client and the pair is cooled for the quoted wait.
 		wait := resourceLimitRetryAfter(err.Error())
-		log.Printf("qoder: resource_limit status=%d wait=%s — cooling pair, reporting 429", status, wait)
-		return &statusError{status: status, err: err}
+		log.Printf("qoder: resource_limit status=%d wait=%s — cooling pair", status, wait)
+		// Status-less on purpose: a 4xx from a streamed request makes the host
+		// re-execute (bootstrap retry) until its budget runs out and then
+		// report a bare 500; a plain error cools the pair and lets the host
+		// answer 503 + Retry-After on the next attempt. See resourceLimitError.
+		return resourceLimitError(err.Error())
 	}
 	if status == http.StatusUnauthorized ||
 		status == http.StatusPaymentRequired ||

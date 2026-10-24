@@ -62,32 +62,33 @@ func TestResourceLimitRetryAfter(t *testing.T) {
 	}
 }
 
-func TestResourceLimitBecomes429WithRetryHint(t *testing.T) {
+// TestResourceLimitErrorIsStatusLess: the throttled request must not carry a
+// 4xx status. The host's stream bootstrap retries 403/429 pre-first-chunk
+// until the budget is spent and then answers a bare server_error; a plain error
+// cools the pair and lets the host answer 503 + Retry-After instead.
+func TestResourceLimitErrorIsStatusLess(t *testing.T) {
 	upstreamErr := chatUpstreamError(http.StatusForbidden, liveResourceLimitBody)
 	err := upstreamStatusError(http.StatusForbidden, upstreamErr)
 	var se *statusError
-	if !errors.As(err, &se) {
-		t.Fatalf("resource limit must carry a status, got %T", err)
+	if errors.As(err, &se) {
+		t.Fatalf("resource limit must be status-less, got %d", se.StatusCode())
 	}
-	if se.status != http.StatusForbidden {
-		t.Fatalf("status = %d, want the upstream's 403 (host routing)", se.status)
-	}
-	if !strings.Contains(err.Error(), "RESOURCE_LIMIT") || !strings.Contains(err.Error(), `"retryAfterSeconds\":30`) {
+	// The actionable facts survive (wait + the raw body the RPC layer reads).
+	if !strings.Contains(err.Error(), "RESOURCE_LIMIT") || !strings.Contains(err.Error(), "30s") {
 		t.Fatalf("message lost the actionable facts: %s", err.Error())
+	}
+	if got := resourceLimitRetryAfter(err.Error()); got != 30*time.Second {
+		t.Fatalf("wait hint = %v, want 30s", got)
 	}
 	raw := errorEnvelopeFor(err)
 	var env envelope
-	if err := json.Unmarshal(raw, &env); err != nil || env.Error == nil {
-		t.Fatalf("envelope: %v %s", err, raw)
+	if json.Unmarshal(raw, &env) != nil || env.Error == nil {
+		t.Fatalf("envelope: %s", raw)
 	}
-	if env.Error.HTTPStatus != http.StatusTooManyRequests {
-		t.Fatalf("http_status = %d, want 429", env.Error.HTTPStatus)
+	if env.Error.HTTPStatus != 0 {
+		t.Fatalf("http_status = %d, want none", env.Error.HTTPStatus)
 	}
-	if env.Error.RetryAfter != 30 {
-		t.Fatalf("retry_after = %d, want 30", env.Error.RetryAfter)
-	}
-	// The generic 403 shape keeps its old behaviour: no status, no hint.
-	// (A plain 403 without the marker is still status-less for the host.)
+	// A plain 403 (no marker) is untouched as before.
 	plain := upstreamStatusError(http.StatusForbidden, errors.New("forbidden"))
 	var plainSE *statusError
 	if errors.As(plain, &plainSE) {
@@ -122,5 +123,47 @@ func TestResourceLimitCoolsPairForUpstreamWait(t *testing.T) {
 	defer restore2()
 	if modelIsCooling("q-cn", "qunmodel") {
 		t.Fatal("pair still cooling after the upstream's wait")
+	}
+}
+
+// TestResourceLimitParkVerdict: the streaming pump parks a throttled request
+// instead of failing it, and the hand-off recognises the park.
+func TestResourceLimitParkVerdict(t *testing.T) {
+	g := newStreamHeadGate(time.Second)
+	if g == nil {
+		t.Fatal("gate unexpectedly disabled")
+	}
+	if !isResourceLimitFailure(liveResourceLimitBody) {
+		t.Fatal("live body not classified")
+	}
+	g.abort(0, errParkedResourceLimit)
+	v, decided := g.awaitHandoff(time.Second)
+	if !decided || !isParkedVerdict(v) {
+		t.Fatalf("park verdict lost: decided=%v v=%+v", decided, v)
+	}
+	// A normal failure verdict is not mistaken for a park.
+	if isParkedVerdict(headVerdict{status: 429, err: errors.New("x")}) {
+		t.Fatal("failure verdict read as park")
+	}
+	if err := resourceLimitUnavailableError(); err == nil {
+		t.Fatal("park error missing")
+	} else if strings.Contains(err.Error(), "RESOURCE_LIMIT") == false && !strings.Contains(err.Error(), "throttled") {
+		t.Fatalf("park error lost its reason: %s", err.Error())
+	}
+}
+
+// TestPublicChatPathNeverCarriesStatus pins why the fix for the 500 cannot be
+// "send 429 from the plugin": the host's stream bootstrap treats 4xx (and
+// 403/429 specifically) as retryable and drops the executor status, so the
+// client ends up with a bare server_error. Streamed and sync chat errors for
+// this family must therefore be status-less; only the non-stream path, where
+// the host's executionErrorMessage keeps the status, reports 429.
+func TestPublicChatPathNeverCarriesStatus(t *testing.T) {
+	upstreamErr := chatUpstreamError(http.StatusForbidden, liveResourceLimitBody)
+	if err := upstreamStatusError(http.StatusForbidden, upstreamErr); err != nil {
+		var se *statusError
+		if errors.As(err, &se) {
+			t.Fatalf("chat path carries %d — the host bootstrap retry will mask it as 500", se.StatusCode())
+		}
 	}
 }

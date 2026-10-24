@@ -120,6 +120,10 @@ type qoderFrameError struct {
 
 func (e *qoderFrameError) Error() string { return e.msg }
 
+// errParkedResourceLimit is the head-gate signal for "accepted, waiting for the
+// upstream's throttle to lift" — not a failure. It never reaches Error() text.
+var errParkedResourceLimit = errors.New("qoder resource limit: request parked until the pair cools")
+
 // streamHeadGate is the one-shot handshake between the async pump (which reads
 // the first upstream frames) and the executor hand-off (which decides what the
 // host gets for this call).
@@ -211,6 +215,20 @@ func (g *streamHeadGate) release() {
 // means the window elapsed with nothing decided: the caller hands the stream
 // over — equivalent to the gate being off — and the gate is claimed here so any
 // later pump failure keeps travelling in-band.
+// park tells a waiting hand-off that the request was accepted and parked
+// (qoder resource limit) instead of failing: no envelope, no stream.
+func (g *streamHeadGate) park() {
+	if g == nil {
+		return
+	}
+	g.abort(0, errParkedResourceLimit)
+}
+
+// isParkedVerdict reports the park signal.
+func isParkedVerdict(v headVerdict) bool {
+	return v.status == 0 && errors.Is(v.err, errParkedResourceLimit)
+}
+
 func (g *streamHeadGate) awaitHandoff(timeout time.Duration) (headVerdict, bool) {
 	if g == nil {
 		return headVerdict{}, false
@@ -312,6 +330,8 @@ func streamChunkAnswers(chunk string) bool {
 // this function reads without emitting (see release below). gate == nil — the
 // default, stream_head_timeout 0 — keeps the historical behavior byte for byte.
 func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time, authID, cooldownModel string, gate *streamHeadGate) {
+	// v0.8.79: the upstream's resource-limit family (10605) lands here and is
+	// handled per release state below, never as an ordinary upstream failure.
 	// Always close the host stream exactly once on every exit path.
 	closed := false
 	closeOnce := func() {

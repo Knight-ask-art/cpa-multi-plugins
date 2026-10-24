@@ -924,8 +924,13 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	// hand-off: the pump owns the verdict channel and never blocks on us.
 	headTimeout := streamHeadTimeout()
 	gate := newStreamHeadGate(headTimeout)
+	// v0.8.79: the pump reports a dedicated park verdict for the qoder
+	// resource-limit family; it is handled before the ordinary failure path.
 	go pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, cooldownModel, gate)
-	if verdict, decided := gate.awaitHandoff(headTimeout); decided && verdict.err != nil {
+	if verdict, decided := gate.awaitHandoff(headTimeout); decided && isParkedVerdict(verdict) {
+		// Resource limit parked the request until the pair cools.
+		return nil, resourceLimitUnavailableError()
+	} else if decided && verdict.err != nil {
 		// Nothing was delivered, so the host can rotate/cool on a real status
 		// instead of accepting a successful-looking empty answer. The status is
 		// attached verbatim (headGateStatus already kept anything it could not

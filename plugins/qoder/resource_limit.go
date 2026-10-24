@@ -185,6 +185,32 @@ func unwrapQuotedJSON(body string) string {
 	return s
 }
 
+// resourceLimitError is the error the plugin returns for a throttled request:
+// a 429 carrying the upstream's wait, with the raw body in the message so the
+// RPC boundary can rebuild Retry-After.
+//
+// Streaming note (v0.8.79): the host's stream bootstrap retry drops the
+// executor error's status for this model — a 403/429 from a stream counts as
+// bootstrap-eligible, gets re-executed until the retry budget is spent, and
+// then surfaces as a bare server_error. A 4xx status is therefore not only
+// pointless here but actively harmful (it triggers that retry storm), so the
+// streaming hand-off returns this error WITHOUT a status; the host reports its
+// own 503 + Retry-After while the pair cools, and the next attempt lands on a
+// credential that is not cooling.
+func resourceLimitError(body string) error {
+	wait := resourceLimitRetryAfter(body)
+	msg := resourceLimitErrorMessage(body, wait)
+	if strings.TrimSpace(body) != "" {
+		msg += " (upstream " + truncateRedacted(body, 300) + ")"
+	}
+	return errors.New(msg)
+}
+
+// resourceLimitUnavailableError is the non-status form for the parked stream.
+func resourceLimitUnavailableError() error {
+	return errors.New("qoder: model is throttled (RESOURCE_LIMIT) right now — the request was not started; retry after the cooldown")
+}
+
 // resourceLimitCarrier is rebuilt from the 429 statusError by
 // errorEnvelopeFor so the host's MarkResult sees both the status and the
 // upstream's retry hint (retryAfterFromError keys on RetryAfter()).
