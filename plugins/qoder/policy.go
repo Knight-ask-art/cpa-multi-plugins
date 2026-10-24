@@ -8,6 +8,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -174,12 +175,21 @@ func chatInputTooLarge(status int, body string) bool {
 // "stop hammering a drained credential" behavior requested on 2026-09-20.
 type statusError struct {
 	status int
-	err    error
+	// httpStatus, when non-zero, is what crosses the RPC boundary as
+	// http_status — v0.8.79 uses it to report a resource-limit 403 as 429
+	// while keeping the upstream's own number for diagnostics.
+	httpStatus int
+	err        error
 }
 
-func (e *statusError) Error() string   { return e.err.Error() }
-func (e *statusError) StatusCode() int { return e.status }
-func (e *statusError) Unwrap() error   { return e.err }
+func (e *statusError) Error() string { return e.err.Error() }
+func (e *statusError) StatusCode() int {
+	if e != nil && e.httpStatus > 0 {
+		return e.httpStatus
+	}
+	return e.status
+}
+func (e *statusError) Unwrap() error { return e.err }
 
 // upstreamStatusError wraps a translated upstream chat failure with the HTTP
 // status the host cooldown layer should attribute to the credential.
@@ -190,6 +200,18 @@ func (e *statusError) Unwrap() error   { return e.err }
 // failures are request-level by definition; both keep the host's 1-minute
 // transient default (pre-0.8.13 behavior unchanged).
 func upstreamStatusError(status int, err error) error {
+	// v0.8.79: the qoder queue family (10605 RESOURCE_LIMIT) is observed as a
+	// 403, but it is the upstream saying "wait N seconds" — the client should
+	// see 429 (with the wait attached by errorEnvelopeFor), not a 500.
+	if isResourceLimitFailure(err.Error()) {
+		// v0.8.79: classified by body, not status. The status stays the
+		// upstream's own 403 (the host's 403 handling is the plan-gate family's
+		// "skip this credential"), while errorEnvelopeFor reports 429 +
+		// Retry-After to the client and the pair is cooled for the quoted wait.
+		wait := resourceLimitRetryAfter(err.Error())
+		log.Printf("qoder: resource_limit status=%d wait=%s — cooling pair, reporting 429", status, wait)
+		return &statusError{status: status, err: err}
+	}
 	if status == http.StatusUnauthorized ||
 		status == http.StatusPaymentRequired ||
 		status == http.StatusTooManyRequests {

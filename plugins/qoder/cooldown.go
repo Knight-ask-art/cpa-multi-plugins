@@ -22,6 +22,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -46,6 +47,10 @@ type cooldownReason string
 const (
 	cooldownReasonRateLimit cooldownReason = "rate_limit"
 	cooldownReasonUnknown   cooldownReason = "upstream_error"
+	// cooldownReasonResourceLimit is the v0.8.79 qoder queue family (10605):
+	// the TTL is the upstream-quoted wait (resourceLimitRetryAfter), not the
+	// fixed rate-limit window.
+	cooldownReasonResourceLimit cooldownReason = "resource_limit"
 )
 
 type modelCooldownKey struct {
@@ -126,14 +131,21 @@ var (
 // are ignored: without a model ID the entry would freeze the account, and
 // without an auth ID it would freeze the model everywhere.
 func markModelCooldown(authID, model string, reason cooldownReason) {
-	authID = strings.TrimSpace(authID)
-	model = strings.TrimSpace(model)
-	if authID == "" || model == "" {
-		return
-	}
 	ttl := modelCooldownUnknown
 	if reason == cooldownReasonRateLimit {
 		ttl = modelCooldownRateLimit
+	}
+	markModelCooldownFor(authID, model, reason, ttl)
+}
+
+// markModelCooldownFor records a throttled pair with an explicit TTL (v0.8.79:
+// resource-limit entries carry the upstream-quoted wait). Non-positive TTLs
+// are ignored, same as an empty half.
+func markModelCooldownFor(authID, model string, reason cooldownReason, ttl time.Duration) {
+	authID = strings.TrimSpace(authID)
+	model = strings.TrimSpace(model)
+	if authID == "" || model == "" || ttl <= 0 {
+		return
 	}
 	now := cooldownNowFn()
 	cooldownMu.Lock()
@@ -141,6 +153,10 @@ func markModelCooldown(authID, model string, reason cooldownReason) {
 	if len(cooldownTable) >= modelCooldownMaxEntries {
 		// Table full: evict the entry that expires soonest — it is the one
 		// closest to natural expiry anyway.
+		// v0.8.79: evict a key that is actually in the table. The old loop's
+		// zero-value fallback and the Sweep-before-insert ordering could leave
+		// nothing to delete, and the insert below then grew the table past the
+		// bound.
 		var oldestKey modelCooldownKey
 		oldestUntil := time.Time{}
 		first := true
@@ -149,7 +165,12 @@ func markModelCooldown(authID, model string, reason cooldownReason) {
 				oldestKey, oldestUntil, first = k, v.Until, false
 			}
 		}
-		delete(cooldownTable, oldestKey)
+		if !first {
+			delete(cooldownTable, oldestKey)
+		}
+		if len(cooldownTable) >= modelCooldownMaxEntries {
+			return // table is already expired-only; do not grow it further
+		}
 	}
 	cooldownTable[modelCooldownKey{AuthID: authID, ModelID: model}] = modelCooldownEntry{
 		Reason:    reason,
@@ -315,6 +336,15 @@ func recordUpstreamFailure(authID, model string, status int, body string) {
 	// plan currently cannot serve, while the rest of the catalog stays live.
 	if isPlanGateFailure(body) {
 		markModelCooldown(authID, model, cooldownReasonRateLimit)
+		return
+	}
+	// v0.8.79: the qoder queue/throttle family (10605 RESOURCE_LIMIT) arrives
+	// as 403 — classified by body, cooled for exactly the upstream-quoted wait
+	// so scheduling moves off the throttled pair instead of colliding again.
+	if isResourceLimitFailure(body) {
+		wait := resourceLimitRetryAfter(body)
+		markModelCooldownFor(authID, model, cooldownReasonResourceLimit, wait)
+		log.Printf("qoder: resource_limit model=%s auth=%s — cooling %s (upstream wait)", model, authID, wait)
 		return
 	}
 	if status == 429 || isSoftRateLimit(status, body) {

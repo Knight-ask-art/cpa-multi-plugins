@@ -323,6 +323,9 @@ type envelopeError struct {
 	// cooldown — "failed credential keeps being picked".
 	Message    string `json:"message"`
 	HTTPStatus int    `json:"http_status,omitempty"`
+	// RetryAfter (seconds, v0.8.79) is surfaced to the client as Retry-After
+	// by the host's error writer for 429-style failures.
+	RetryAfter int `json:"retry_after,omitempty"`
 }
 
 type identifierResponse struct {
@@ -354,7 +357,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.8.78"
+var version = "0.8.79"
 
 // providerName is a VAR (split flavor, issue #29): the unified build keeps
 // the default "qoder"; the split-channel builds rename it via
@@ -957,8 +960,23 @@ func errorEnvelope(code, message string) []byte {
 func errorEnvelopeFor(err error) []byte {
 	var sc interface{ StatusCode() int }
 	if errors.As(err, &sc) && sc.StatusCode() > 0 {
+		// v0.8.79: a resource-limit 429 carries the upstream's own wait, so
+		// the client's Retry-After and the host's quota backoff both use it.
+		httpStatus := sc.StatusCode()
+		retryAfter := 0
+		if carrier := asResourceLimitCarrier(err); carrier != nil {
+			if d := carrier.RetryAfter(); d != nil {
+				retryAfter = int(d.Round(time.Second) / time.Second)
+			}
+		}
+		if asResourceLimitCarrier(err) != nil {
+			// The host's own status for this credential stays the upstream's
+			// 403 (it decides routing); the client, however, gets the 429 it
+			// can act on, with the upstream's wait in Retry-After.
+			httpStatus = http.StatusTooManyRequests
+		}
 		raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
-			Code: "plugin_error", Message: err.Error(), HTTPStatus: sc.StatusCode(),
+			Code: "plugin_error", Message: err.Error(), HTTPStatus: httpStatus, RetryAfter: retryAfter,
 		}})
 		return raw
 	}
